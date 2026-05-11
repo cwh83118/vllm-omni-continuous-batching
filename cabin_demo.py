@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""In-car cabin-assistant continuous-batching demo.
+"""In-car cabin-assistant demo — compare three request-scheduling regimes on ONE engine.
 
 Two request streams hit the *same* vLLM-Omni (Qwen3-Omni-30B-A3B Thinker) engine:
 
@@ -8,30 +8,39 @@ Two request streams hit the *same* vLLM-Omni (Qwen3-Omni-30B-A3B Thinker) engine
   * "interactive" brain — the user speaks at arbitrary moments and waits for a reply.
     Latency-sensitive.
 
-Run the engine once with a given thinker `max_num_seqs`, then run this script:
+We run the engine once with a generous ``max_num_seqs`` and emulate three scheduling
+regimes purely on the client side (an *admission controller*), so the only variable is
+the admission/refill policy — same model, same server, same workload (same ``--seed`` =>
+identical arrival times, identical per-request sampling ``seed`` => identical outputs):
 
-  * max_num_seqs = 1   -> "no continuous batching": the engine runs one sequence at a
-    time, FCFS.  An interactive request that arrives while a proactive inference is in
-    flight has to wait for it to finish.  Everyone waits for everyone.
-  * max_num_seqs >= 2  -> continuous batching: a request arriving mid-generation joins
-    the running batch on the very next decode step; a request that hits EoS is released
-    immediately, regardless of what else is still generating.
+  --mode none        : no batching.  At most 1 request in flight; the next is admitted
+                       only when the current one finishes.  (== a max_num_seqs=1 server.)
+  --mode static  -B  : "fixed-batch" / NPU-style.  Admit a wave of up to B queued
+                       requests; while the wave runs, hold ALL new arrivals; a finished
+                       request streams out immediately, but its freed slot stays empty
+                       until the whole wave drains; then admit the next wave of up to B.
+  --mode continuous -B: continuous batching.  At most B in flight; the instant any request
+                       finishes, immediately admit the next queued one (refill the slot).
+                       This is what vLLM / vLLM-Omni does internally (cap = B here).
 
-For every request we record: t_submit, t_first_token (TTFT), t_finish (EoS / result
-released to the user), number of output tokens.  Results are dumped to JSON and a
-comparison table is printed.
+Per request we record: t_submit (arrived / entered the client queue), t_admitted (left
+the queue, request actually started), t_first_token (=> TTFT = first_token - submit),
+t_finish (EoS / result released), n_out_tokens, and wave_id (which static wave).
 
 Usage:
-  python cabin_demo.py --config off  --port 8901   # against a max_num_seqs=1 server
-  python cabin_demo.py --config on   --port 8901   # against a max_num_seqs=8 server
+  python cabin_demo.py --mode none       --batch-size 1 --out results/run_none.json
+  python cabin_demo.py --mode static     --batch-size 8 --out results/run_static.json
+  python cabin_demo.py --mode continuous --batch-size 8 --out results/run_continuous.json
+  python cabin_demo.py --mode static --batch-size 8 --burst 24 --out results/burst_static.json
 """
 import argparse
 import asyncio
 import json
+import os
 import random
 import statistics
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 
 from openai import AsyncOpenAI
 
@@ -74,23 +83,34 @@ INTERACTIVE_QUERIES = [
     "前面那段一直在塞，有沒有別條路可以繞過去？大概可以省多少時間？",
 ]
 
-# ----------------------------------------------------------------------------- model
+# ----------------------------------------------------------------------------- request
 
 @dataclass
 class Req:
     rid: str
     brain: str            # "proactive" | "interactive"
     idx: int
-    t_submit: float = 0.0
+    gidx: int             # global arrival index (for deterministic per-request seed)
+    sys_prompt: str
+    user_prompt: str
+    max_tokens: int
+    temperature: float
+    t_submit: float = 0.0       # entered the client queue (= "arrived")
+    t_admitted: float = 0.0     # left the queue, request actually started
     t_first_token: float = 0.0
     t_finish: float = 0.0
     n_out_tokens: int = 0
+    wave_id: int = -1           # which static wave (static mode only)
     content: str = ""
     error: str = ""
 
     @property
     def ttft(self) -> float:
         return (self.t_first_token - self.t_submit) if self.t_first_token else float("nan")
+
+    @property
+    def queue_wait(self) -> float:
+        return (self.t_admitted - self.t_submit) if self.t_admitted else float("nan")
 
     @property
     def e2e(self) -> float:
@@ -102,17 +122,19 @@ class Req:
         return (self.n_out_tokens - 1) / dt if (self.t_first_token and dt > 0 and self.n_out_tokens > 1) else float("nan")
 
 
-async def run_request(client, model, sys_prompt, user_prompt, max_tokens, temperature,
-                      req: Req, t0: float, log):
-    req.t_submit = time.monotonic()
-    log(f"[t={req.t_submit - t0:6.2f}s] {req.brain:<11s} #{req.idx:<2d} submitted")
+async def run_request(client, model, req: Req, t0: float, seed: int, log):
+    req.t_admitted = time.monotonic()
+    wq = req.queue_wait * 1000
+    log(f"[t={req.t_admitted - t0:6.2f}s] {req.brain:<11s} #{req.idx:<2d} admitted   "
+        f"(waited {wq:6.0f} ms in client queue" + (f", wave #{req.wave_id}" if req.wave_id >= 0 else "") + ")")
     try:
         stream = await client.chat.completions.create(
             model=model,
-            messages=[{"role": "system", "content": sys_prompt},
-                      {"role": "user", "content": user_prompt}],
-            max_tokens=max_tokens,
-            temperature=temperature,
+            messages=[{"role": "system", "content": req.sys_prompt},
+                      {"role": "user", "content": req.user_prompt}],
+            max_tokens=req.max_tokens,
+            temperature=req.temperature,
+            seed=seed,
             stream=True,
             stream_options={"include_usage": True},
         )
@@ -123,7 +145,8 @@ async def run_request(client, model, sys_prompt, user_prompt, max_tokens, temper
                     if not req.t_first_token:
                         req.t_first_token = time.monotonic()
                         log(f"[t={req.t_first_token - t0:6.2f}s] {req.brain:<11s} #{req.idx:<2d} first token "
-                            f"(waited {req.ttft*1000:6.0f} ms after submit)")
+                            f"(TTFT {req.ttft*1000:6.0f} ms = {req.queue_wait*1000:.0f} queue + "
+                            f"{(req.t_first_token-req.t_admitted)*1000:.0f} prefill)")
                     req.content += delta.content
             if getattr(chunk, "usage", None):
                 req.n_out_tokens = chunk.usage.completion_tokens
@@ -132,77 +155,143 @@ async def run_request(client, model, sys_prompt, user_prompt, max_tokens, temper
             req.n_out_tokens = max(1, len(req.content) // 2)
         log(f"[t={req.t_finish - t0:6.2f}s] {req.brain:<11s} #{req.idx:<2d} DONE  "
             f"({req.n_out_tokens:3d} tok, e2e {req.e2e:5.2f}s, decode {req.decode_tps:5.1f} tok/s)  "
-            f"-> {req.content[:46].replace(chr(10),' ')!r}")
+            f"-> {req.content[:42].replace(chr(10),' ')!r}")
     except Exception as e:  # noqa: BLE001
         req.t_finish = time.monotonic()
         req.error = repr(e)
         log(f"[t={req.t_finish - t0:6.2f}s] {req.brain:<11s} #{req.idx:<2d} ERROR {e!r}")
 
 
-async def burst_loop(client, args, reqs, t0, log):
-    """Saturated scenario: fire args.burst interactive requests (almost) simultaneously
-    at t~=1.0s. Shows the throughput / weight-bandwidth amortisation story: with
-    continuous batching all of them decode together (one weight read per step shared
-    by the whole batch); without it they run one after another."""
-    await asyncio.sleep(1.0)
-    log(f"[t={time.monotonic()-t0:6.2f}s] --- BURST: submitting {args.burst} requests at once ---")
-    tasks = []
-    for i in range(args.burst):
-        q = INTERACTIVE_QUERIES[i % len(INTERACTIVE_QUERIES)]
-        r = Req(rid=f"B{i}", brain="interactive", idx=i)
-        reqs.append(r)
-        tasks.append(asyncio.create_task(run_request(
-            client, args.model, INTERACTIVE_SYSTEM, q,
-            args.interactive_max_tokens, 0.6, r, t0, log)))
-    await asyncio.gather(*tasks)
+# --------------------------------------------------------------------- admission controller
+
+class Dispatcher:
+    """Client-side admission controller emulating the three scheduling regimes."""
+
+    def __init__(self, client, args, t0, log):
+        self.client = client
+        self.args = args
+        self.t0 = t0
+        self.log = log
+        self.mode = args.mode                       # none | static | continuous
+        self.B = 1 if self.mode == "none" else max(1, args.batch_size)
+        self.wave_mode = self.mode in ("none", "static")   # "drain whole wave before next"
+        self.pending: list[Req] = []                # arrived, not yet admitted
+        self.in_flight: set[asyncio.Task] = set()
+        self.reqs: list[Req] = []                   # all Req objects, in arrival order
+        self.kick = asyncio.Event()
+        self.arrivals_done = False
+        self.wave_counter = 0
+
+    def submit(self, req: Req):
+        """Called by the arrival generators when a request 'arrives'."""
+        req.t_submit = time.monotonic()
+        self.reqs.append(req)
+        self.pending.append(req)
+        self.log(f"[t={req.t_submit - self.t0:6.2f}s] {req.brain:<11s} #{req.idx:<2d} arrived    "
+                 f"(pending {len(self.pending)}, in-flight {len(self.in_flight)})")
+        self.kick.set()
+
+    def mark_arrivals_done(self):
+        self.arrivals_done = True
+        self.kick.set()
+
+    # -- internal --
+    def _start(self, req: Req, wave_id: int):
+        req.wave_id = wave_id
+        seed = self.args.seed * 100003 + req.gidx
+        task = asyncio.create_task(run_request(self.client, self.args.model, req, self.t0, seed, self.log))
+        task.add_done_callback(self._on_done)
+        self.in_flight.add(task)
+
+    def _on_done(self, task):
+        self.in_flight.discard(task)
+        self.kick.set()
+
+    def _maybe_admit(self):
+        if self.wave_mode:
+            # admit a new wave (size up to B) only when nothing is in flight
+            if self.in_flight or not self.pending:
+                return
+            n = min(self.B, len(self.pending))
+            wid = self.wave_counter
+            self.wave_counter += 1
+            had = len(self.pending)
+            if self.mode == "static":
+                self.log(f"[t={time.monotonic() - self.t0:6.2f}s] --- wave #{wid}: admitting {n} req "
+                         f"(pending was {had}) ---")
+            for _ in range(n):
+                self._start(self.pending.pop(0), wave_id=wid)
+        else:  # continuous: keep up to B in flight, refilling the instant a slot frees
+            while len(self.in_flight) < self.B and self.pending:
+                self._start(self.pending.pop(0), wave_id=-1)
+
+    async def run(self):
+        while True:
+            self._maybe_admit()
+            if self.arrivals_done and not self.pending and not self.in_flight:
+                return
+            self.kick.clear()
+            try:
+                await asyncio.wait_for(self.kick.wait(), timeout=0.5)
+            except asyncio.TimeoutError:
+                pass
 
 
-async def proactive_loop(client, args, reqs, t0, log, stop_at):
+# ------------------------------------------------------------------------- arrival generators
+
+async def proactive_arrivals(disp: Dispatcher, args, t0):
     i = 0
-    # first proactive fires shortly after t0 so an interactive can land mid-inference
     await asyncio.sleep(0.5)
-    tasks = []
-    while time.monotonic() - t0 < stop_at:
+    while time.monotonic() - t0 < args.duration:
         scene = PROACTIVE_SCENES[i % len(PROACTIVE_SCENES)]
-        r = Req(rid=f"P{i}", brain="proactive", idx=i)
-        reqs.append(r)
-        tasks.append(asyncio.create_task(run_request(
-            client, args.model, PROACTIVE_SYSTEM, PROACTIVE_PROMPT_PREFIX + scene,
-            args.proactive_max_tokens, 0.3, r, t0, log)))
+        disp.submit(Req(rid=f"P{i}", brain="proactive", idx=i, gidx=_next_gidx(),
+                        sys_prompt=PROACTIVE_SYSTEM, user_prompt=PROACTIVE_PROMPT_PREFIX + scene,
+                        max_tokens=args.proactive_max_tokens, temperature=0.3))
         i += 1
         await asyncio.sleep(args.proactive_interval)
-    if tasks:
-        await asyncio.gather(*tasks)
 
 
-async def interactive_loop(client, args, reqs, t0, log, stop_at):
+async def interactive_arrivals(disp: Dispatcher, args, t0):
     rng = random.Random(args.seed)
-    # Poisson arrivals at rate args.interactive_rate (req/s), first arrival ~1.5s in,
-    # capped at args.n_interactive requests.
     times = []
     t = 1.5
-    while t < stop_at - 1.0 and len(times) < args.n_interactive:
+    while t < args.duration - 1.0 and len(times) < args.n_interactive:
         times.append(t)
         t += rng.expovariate(args.interactive_rate)
-    tasks = []
     i = 0
     for at in times:
         now = time.monotonic() - t0
         if at > now:
             await asyncio.sleep(at - now)
         q = INTERACTIVE_QUERIES[i % len(INTERACTIVE_QUERIES)]
-        r = Req(rid=f"I{i}", brain="interactive", idx=i)
-        reqs.append(r)
-        tasks.append(asyncio.create_task(run_request(
-            client, args.model, INTERACTIVE_SYSTEM, q,
-            args.interactive_max_tokens, 0.6, r, t0, log)))
+        disp.submit(Req(rid=f"I{i}", brain="interactive", idx=i, gidx=_next_gidx(),
+                        sys_prompt=INTERACTIVE_SYSTEM, user_prompt=q,
+                        max_tokens=args.interactive_max_tokens, temperature=0.6))
         i += 1
-    if tasks:
-        await asyncio.gather(*tasks)
 
+
+async def burst_arrivals(disp: Dispatcher, args, t0):
+    await asyncio.sleep(1.0)
+    disp.log(f"[t={time.monotonic()-t0:6.2f}s] --- BURST: {args.burst} requests arrive at once ---")
+    for i in range(args.burst):
+        q = INTERACTIVE_QUERIES[i % len(INTERACTIVE_QUERIES)]
+        disp.submit(Req(rid=f"B{i}", brain="interactive", idx=i, gidx=_next_gidx(),
+                        sys_prompt=INTERACTIVE_SYSTEM, user_prompt=q,
+                        max_tokens=args.interactive_max_tokens, temperature=0.6))
+
+
+# tiny global gidx counter so the per-request sampling seed is stable across modes
+_GIDX = [0]
+def _next_gidx() -> int:
+    v = _GIDX[0]
+    _GIDX[0] += 1
+    return v
+
+
+# ------------------------------------------------------------------------------ summary
 
 def pct(xs, p):
-    xs = sorted(v for v in xs if v == v)  # drop NaN
+    xs = sorted(v for v in xs if v == v)
     if not xs:
         return float("nan")
     k = (len(xs) - 1) * p / 100.0
@@ -210,122 +299,140 @@ def pct(xs, p):
     return xs[lo] + (xs[hi] - xs[lo]) * (k - lo)
 
 
-def summarize(reqs, wall, config, max_num_seqs):
+def summarize(reqs, wall, args):
     inter = [r for r in reqs if r.brain == "interactive" and not r.error]
     pro = [r for r in reqs if r.brain == "proactive" and not r.error]
     ok = [r for r in reqs if not r.error and r.t_finish]
     total_out = sum(r.n_out_tokens for r in reqs if not r.error)
     busy = (max(r.t_finish for r in ok) - min(r.t_submit for r in ok)) if ok else float("nan")
-    s = {
-        "config": config, "max_num_seqs": max_num_seqs,
+    n_waves = (max((r.wave_id for r in reqs if r.wave_id >= 0), default=-1) + 1)
+    return {
+        "mode": args.mode, "batch_size": (1 if args.mode == "none" else args.batch_size),
+        "config": args.config, "server_max_num_seqs": args.max_num_seqs,
         "wall_clock_s": round(wall, 3),
         "busy_span_s": round(busy, 3),
         "busy_output_tok_per_s": round(total_out / busy, 1) if busy and busy > 0 else 0.0,
         "n_requests_total": len(reqs), "n_errors": sum(1 for r in reqs if r.error),
-        "n_interactive": len(inter), "n_proactive": len(pro),
+        "n_interactive": len(inter), "n_proactive": len(pro), "n_waves": n_waves,
         "interactive_ttft_p50_s": round(pct([r.ttft for r in inter], 50), 3),
         "interactive_ttft_p95_s": round(pct([r.ttft for r in inter], 95), 3),
         "interactive_ttft_max_s": round(max([r.ttft for r in inter], default=float("nan")), 3),
         "interactive_e2e_p50_s": round(pct([r.e2e for r in inter], 50), 3),
         "interactive_e2e_p95_s": round(pct([r.e2e for r in inter], 95), 3),
+        "interactive_queue_wait_p50_s": round(pct([r.queue_wait for r in inter], 50), 3),
         "proactive_ttft_p50_s": round(pct([r.ttft for r in pro], 50), 3),
         "proactive_e2e_p50_s": round(pct([r.e2e for r in pro], 50), 3),
         "proactive_e2e_max_s": round(max([r.e2e for r in pro], default=float("nan")), 3),
         "total_output_tokens": total_out,
-        "aggregate_output_tok_per_s": round(total_out / wall, 1) if wall > 0 else 0.0,
         "mean_decode_tok_per_s": round(statistics.fmean(
             [r.decode_tps for r in reqs if not r.error and r.decode_tps == r.decode_tps]), 1)
             if any(r.decode_tps == r.decode_tps for r in reqs if not r.error) else float("nan"),
     }
-    return s
 
 
 def print_table(s):
-    print("\n" + "=" * 78)
-    print(f" SUMMARY  config={s['config']!r}  thinker max_num_seqs={s['max_num_seqs']}")
-    print("=" * 78)
+    print("\n" + "=" * 80)
+    print(f" SUMMARY  mode={s['mode']!r}  batch_size={s['batch_size']}  "
+          f"server_max_num_seqs={s['server_max_num_seqs']}")
+    print("=" * 80)
     rows = [
-        ("wall clock (s)", s["wall_clock_s"]),
-        ("requests done (interactive / proactive)", f"{s['n_interactive']} / {s['n_proactive']}  (errors {s['n_errors']})"),
+        ("requests done (interactive / proactive)", f"{s['n_interactive']} / {s['n_proactive']}  (errors {s['n_errors']}, waves {s['n_waves']})"),
         ("interactive TTFT  p50 / p95 / max  (s)", f"{s['interactive_ttft_p50_s']} / {s['interactive_ttft_p95_s']} / {s['interactive_ttft_max_s']}"),
-        ("interactive e2e   p50 / p95        (s)", f"{s['interactive_e2e_p50_s']} / {s['interactive_e2e_p95_s']}"),
-        ("proactive   TTFT  p50  / e2e p50 / e2e max (s)", f"{s['proactive_ttft_p50_s']} / {s['proactive_e2e_p50_s']} / {s['proactive_e2e_max_s']}"),
+        ("interactive  e2e  p50 / p95        (s)", f"{s['interactive_e2e_p50_s']} / {s['interactive_e2e_p95_s']}"),
+        ("interactive queue-wait p50          (s)", f"{s['interactive_queue_wait_p50_s']}"),
+        ("proactive  TTFT p50 / e2e p50 / e2e max (s)", f"{s['proactive_ttft_p50_s']} / {s['proactive_e2e_p50_s']} / {s['proactive_e2e_max_s']}"),
         ("total output tokens", s["total_output_tokens"]),
         ("busy span (first submit -> last finish) (s)", s["busy_span_s"]),
-        ("aggregate output throughput over busy span (tok/s)", s["busy_output_tok_per_s"]),
+        ("output throughput over busy span (tok/s)", s["busy_output_tok_per_s"]),
         ("mean per-request decode speed (tok/s)", s["mean_decode_tok_per_s"]),
     ]
     for k, v in rows:
         print(f"  {k:<46s}: {v}")
-    print("=" * 78 + "\n")
+    print("=" * 80 + "\n")
 
+
+# --------------------------------------------------------------------------------- main
 
 async def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default="on", help="label for this run (e.g. on / off)")
+    ap.add_argument("--mode", choices=["none", "static", "continuous"], default="continuous",
+                    help="scheduling regime to emulate")
+    ap.add_argument("--batch-size", type=int, default=8, help="batch cap B for static/continuous (none forces 1)")
+    ap.add_argument("--config", default=None, help="label for this run (default = mode)")
     ap.add_argument("--max-num-seqs", type=int, default=None,
-                    help="thinker max_num_seqs the server was launched with (for the record / label)")
+                    help="the server's max_num_seqs (for the record); must be >= --batch-size")
     ap.add_argument("--host", default="localhost")
     ap.add_argument("--port", type=int, default=8901)
     ap.add_argument("--model", default="qwen3-omni")
-    ap.add_argument("--duration", type=float, default=30.0, help="seconds to keep submitting new requests")
+    ap.add_argument("--duration", type=float, default=24.0, help="seconds to keep accepting new arrivals")
     ap.add_argument("--proactive-interval", type=float, default=2.5)
     ap.add_argument("--proactive-max-tokens", type=int, default=220)
-    ap.add_argument("--interactive-rate", type=float, default=1.2, help="interactive Poisson arrival rate (req/s)")
+    ap.add_argument("--interactive-rate", type=float, default=1.6, help="interactive Poisson arrival rate (req/s)")
     ap.add_argument("--interactive-max-tokens", type=int, default=180)
     ap.add_argument("--n-interactive", type=int, default=30, help="cap on number of interactive requests")
     ap.add_argument("--burst", type=int, default=0,
-                    help="if >0: saturated mode -- fire this many interactive requests at once, no proactive loop")
+                    help="if >0: saturated mode -- this many interactive requests arrive at once; no proactive")
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
+    if args.config is None:
+        args.config = args.mode
     if args.out is None:
         args.out = f"results/run_{args.config}.json"
 
-    client = AsyncOpenAI(base_url=f"http://{args.host}:{args.port}/v1", api_key="EMPTY", timeout=120.0)
+    client = AsyncOpenAI(base_url=f"http://{args.host}:{args.port}/v1", api_key="EMPTY", timeout=180.0)
 
-    print(f"# cabin_demo  config={args.config}  max_num_seqs={args.max_num_seqs}  "
+    B = 1 if args.mode == "none" else args.batch_size
+    print(f"# cabin_demo  mode={args.mode}  batch_size={B}  server_max_num_seqs={args.max_num_seqs}  "
           f"server=http://{args.host}:{args.port}  model={args.model}")
-    print(f"# proactive every {args.proactive_interval}s (<= {args.proactive_max_tokens} tok), "
-          f"interactive Poisson {args.interactive_rate}/s cap {args.n_interactive} (<= {args.interactive_max_tokens} tok), "
-          f"submit window {args.duration}s")
-    print("-" * 78)
+    if args.burst > 0:
+        print(f"# burst: {args.burst} interactive requests arrive at once (<= {args.interactive_max_tokens} tok)")
+    else:
+        print(f"# proactive every {args.proactive_interval}s (<= {args.proactive_max_tokens} tok), "
+              f"interactive Poisson {args.interactive_rate}/s cap {args.n_interactive} (<= {args.interactive_max_tokens} tok), "
+              f"arrival window {args.duration}s")
+    print("-" * 80)
 
     log_lines = []
     def log(line):
         print(line, flush=True)
         log_lines.append(line)
 
-    reqs: list[Req] = []
+    _GIDX[0] = 0
     t0 = time.monotonic()
-    if args.burst > 0:
-        await burst_loop(client, args, reqs, t0, log)
-    else:
-        await asyncio.gather(
-            proactive_loop(client, args, reqs, t0, log, args.duration),
-            interactive_loop(client, args, reqs, t0, log, args.duration),
-        )
+    disp = Dispatcher(client, args, t0, log)
+
+    async def arrivals():
+        if args.burst > 0:
+            await burst_arrivals(disp, args, t0)
+        else:
+            await asyncio.gather(proactive_arrivals(disp, args, t0),
+                                 interactive_arrivals(disp, args, t0))
+        disp.mark_arrivals_done()
+
+    await asyncio.gather(disp.run(), arrivals())
     wall = time.monotonic() - t0
 
-    # serialize, relative to t0
     out_reqs = []
-    for r in reqs:
+    for r in disp.reqs:
         d = asdict(r)
-        for k in ("t_submit", "t_first_token", "t_finish"):
+        for k in ("sys_prompt", "user_prompt"):
+            d.pop(k, None)
+        for k in ("t_submit", "t_admitted", "t_first_token", "t_finish"):
             d[k] = round(d[k] - t0, 4) if d[k] else 0.0
         d["ttft_s"] = round(r.ttft, 4) if r.ttft == r.ttft else None
+        d["queue_wait_s"] = round(r.queue_wait, 4) if r.queue_wait == r.queue_wait else None
         d["e2e_s"] = round(r.e2e, 4) if r.e2e == r.e2e else None
         d["decode_tps"] = round(r.decode_tps, 2) if r.decode_tps == r.decode_tps else None
         out_reqs.append(d)
-    s = summarize(reqs, wall, args.config, args.max_num_seqs)
+    s = summarize(disp.reqs, wall, args)
     print_table(s)
 
-    payload = {"config": args.config, "max_num_seqs": args.max_num_seqs,
-               "host": args.host, "port": args.port, "model": args.model,
-               "args": vars(args), "wall_clock_s": round(wall, 3),
+    payload = {"mode": args.mode, "batch_size": B, "config": args.config,
+               "max_num_seqs": args.max_num_seqs, "host": args.host, "port": args.port,
+               "model": args.model, "args": vars(args), "wall_clock_s": round(wall, 3),
                "summary": s, "requests": out_reqs, "log": log_lines}
-    import os
-    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
     print(f"# wrote {args.out}")

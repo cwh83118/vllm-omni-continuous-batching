@@ -1,338 +1,295 @@
-# Continuous Batching on vLLM-Omni —— 在 RTX 5090 上用 Qwen3-Omni-30B-A3B 跑出來的差異
+# 三種 request 排程方式的體驗對比 —— no batching / static (NPU 式) / continuous batching
 
-> 對象：在車用 Blackwell-class 邊緣裝置上要落地的 Qwen-Omni 座艙助手 —— 單顆 GPU 上「主動偵測」與
-> 「交互對話」兩個應用共用同一顆模型。本文用一台 **RTX 5090（Blackwell sm_120, 32 GB）** 實機跑出
-> 「有 / 沒有 continuous batching」的差異，並對應到這兩個應用同時跑時的體驗。
+> 在一台 **RTX 5090（Blackwell sm_120, 32 GB）** 上，用 **vLLM-Omni 0.20.0** serve **Qwen3-Omni-30B-A3B 的
+> Thinker**，量出一個推論服務面對「陸續進來的 request 流」時，三種排程方式的體驗差異 —— 對應到車用座艙助手
+> 「主動偵測」與「交互對話」兩個應用共用同一顆模型的情境。
 
 ---
 
 ## 0. TL;DR
 
-- **vLLM-Omni 支援 continuous batching** —— 它把 omni 模型拆成多個 stage（Thinker / Talker / Code2Wav），
-  每個自回歸（AR）stage 各跑一個標準 vLLM engine，而 continuous batching 就住在那個 AR scheduler 裡。
-- 在這台 5090 上，把 Qwen3-Omni-30B-A3B 的 **Thinker** serve 起來，**唯一變數是 `max_num_seqs`**：
-  `1` ＝「沒有 continuous batching」（一次只跑一條 request、排隊等），`16` ＝「有」。
+同一顆模型、同一個 server、同一份負載（同一個隨機種子 → 三次的到達時間、每個 request 的取樣 seed 完全一樣），
+唯一的變數是 **排程策略**。`B` = batch 大小上限（mode 1 等同 B=1，mode 2/3 取 B=8）。
 
-| 情境 | 指標 | 沒有（`max_num_seqs=1`） | 有（`max_num_seqs=16`） | 倍數 |
-|---|---|--:|--:|--:|
-| **車艙情境**<br>主動偵測每 2.5s + 交互 Poisson ~1.6/s（共 30 交互 + 10 主動偵測） | 交互 TTFT p50 | **946 ms** | **19 ms** | **≈ 50×** |
-| | 交互 TTFT p95 | 2 239 ms | 27 ms | **≈ 83×** |
-| | 交互 TTFT 最差 | 2 357 ms | 67 ms | ≈ 35× |
-| | 交互 端到端 p50 | 1 114 ms | 430 ms | ≈ 2.6× |
-| | 主動偵測 端到端 最差 | 2 192 ms | 806 ms | ≈ 2.7× |
-| **飽和爆量**<br>同一瞬間丟 24 個 request | 輸出吞吐（忙碌區間） | **239 tok/s** | **1 456 tok/s** | **≈ 6.1×** |
-| | 24 個全部算完耗時 | 9.2 s | 1.5 s | ≈ 6.2× |
-| | 交互 TTFT p50 | 4 499 ms | 52 ms | ≈ 87× |
-| | 交互 TTFT 最差 | 8 615 ms | 583 ms | ≈ 15× |
+**情境 A：車艙情境**（「主動偵測」每 2.5s 看一次場景 + 「交互對話」Poisson ~1.6/s 隨機進來，24 秒，共 30 交互 + 10 主動偵測）
 
-*TTFT＝Time To First Token＝使用者按下說話到聽到第一個字的延遲。*
+| 指標 | (1) no batching `B=1` | (2) static / NPU 式 `B=8` | (3) continuous `B=8` |
+|---|--:|--:|--:|
+| 交互 TTFT p50 | **1 020 ms** | **199 ms** | **18 ms** |
+| 交互 TTFT p95 | 2 096 ms | 561 ms | 25 ms |
+| 交互 TTFT 最差 | 2 131 ms | 602 ms | 27 ms |
+| 交互 在 client queue 排隊 p50 | 1 007 ms | 180 ms | 0 ms |
+| 交互 端到端 p50 | 1 252 ms | 640 ms | 438 ms |
+| 主動偵測 端到端 最差 | 1 985 ms | 1 132 ms | 888 ms |
+| 形成的 batch「波」數 | 40（每次 1 條） | 27 | — |
+| 相對 (3) 的倍數（TTFT p50） | **57×** | **11×** | 1× |
 
----
+→ **`continuous` 把 `static` 再快 11 倍、把 `no batching` 快 57 倍**；`static` 介於兩者中間（拿到了「一波裡多條一起算」
+的好處，但新 request 還是得等「上一波整批算完」才能進來）。
 
-## 1. 背景：continuous batching 是什麼、為什麼重要
+**情境 B：飽和爆量**（24 個 request 同一瞬間進來，各 ≤160 tokens）
 
-### 1.1 從推論的成本結構講起
+| 指標 | (1) no batching `B=1` | (2) static `B=8` | (3) continuous `B=8` |
+|---|--:|--:|--:|
+| 交互 TTFT p50 | **4 359 ms** | **904 ms** | **641 ms** |
+| 交互 TTFT 最差 | 8 857 ms | 1 626 ms | 1 412 ms |
+| 24 個全部算完耗時 | **9.16 s** | **2.46 s** | **1.90 s** |
+| 輸出吞吐（忙碌區間） | **238 tok/s** | **863 tok/s** | **1 083 tok/s** |
 
-LLM 推論分兩個階段：**prefill**（把 prompt 一次算完，得到第一個 token）和 **decode**（一次產生一個 token，
-反覆做到 EoS）。decode 階段每產生一個 token，GPU 都要把**整顆模型的權重從 HBM 讀一遍**做矩陣乘法 ——
-這一步是**記憶體頻寬瓶頸**（memory-bandwidth-bound）：算術量很小，但要搬的權重 bytes 很大。
-
-關鍵觀察：**這一次權重讀，可以同時服務很多條序列。** 如果 batch 裡有 N 條 request 同時在 decode，
-那一次把權重從 HBM 讀進來，就同時推進了 N 個 token —— 等於同樣的頻寬做了 N 倍的有效工作。
-所以「把多條 request 併在一起算」對吞吐 / 省頻寬是巨大的槓桿。
-
-### 1.2 Static batching vs Continuous batching
-
-- **Static / 固定 batching**（最樸素的做法，等同 `model.generate([...])` 一次餵一批）：
-  湊一批 N 條一起算，**全部算到完才能拿結果、才能收下一批**。問題：
-  1. batch 裡有人輸出 5 個 token、有人輸出 500 個 → 短的那條早就算完了，卻得空轉等最長的那條（GPU 浪費、延遲爆炸）；
-  2. 已經在跑的時候，新進來的 request 只能等下一批 → 高延遲；
-  3. 為了等湊滿一批，要嘛等很久（延遲），要嘛 batch 沒滿就跑（吞吐差）。
-- **Continuous / in-flight batching（vLLM 的做法）**：scheduler 在**每一個 decode step** 都重新排程 ——
-  - 哪一條打到 EoS，**這個 step 結束就把它從 running batch 移除、結果立刻釋出**，不必等別人；
-  - 哪一條新 request 進來（在 waiting queue），**下一個 step 就把它併進正在跑的 batch**，不必等下一批；
-  - running batch 隨時動態地填到 `max_num_seqs` 那麼大 → GPU 一直滿載、權重讀一直被攤提到很多條。
-
-  這就是你描述的：「同顆模型、不同時間點進來的 input 都能隨時 batch 在一起，拿一次權重後即可推論 → 極省頻寬；
-  某個 prompt 算到 EoS 就釋出他的結果、下一個 input 隨時可進、不用等整批算完。」
-
-### 1.3 為什麼這對「車艙助手」這類場景特別重要
-
-這類車用 Qwen-Omni 座艙助手會同時跑（至少）兩種任務，**共用同一顆模型**：
-
-- **「主動偵測」**：每隔幾秒看一張艙內 / 艙外的圖片（或場景），判斷要不要採取動作 ——
-  調冷氣、關窗、提醒疲勞駕駛、播音樂…（輸出一段觀察 + 一行 function-call JSON + 理由）。**週期性、可預測。**
-- **「交互對話」**：使用者**隨時**用語音問問題，要馬上得到回應。**對延遲敏感**（使用者在等）。
-
-如果**沒有** continuous batching、兩種任務又共用一顆模型：主動偵測每 4 秒一輪、每輪 decode 要一兩秒以上，
-那這一兩秒內進來的交互 request 只能**排在後面等**——使用者按下說話、卻要等主動偵測那一輪算完才開始有反應。
-如果同時又來好幾個 request（多位乘客、追問），就一個一個排隊，最後那個等好幾秒。**這就是體驗問題。**
-
-有了 continuous batching：交互 request 在主動偵測 decode 到一半時就**併進同一個 batch**，
-~20 ms 就吐第一個字；主動偵測**完全不受影響**繼續跑；多個 request 一起進來就一起算（不是排隊）。
+圖：[`results/timeline_3way.png`](results/timeline_3way.png)（車艙情境）、[`results/timeline_3way_burst.png`](results/timeline_3way_burst.png)（飽和爆量）。
 
 ---
 
-## 2. vLLM-Omni 支援 continuous batching 嗎？—— 支援
+## 1. 背景：一個推論服務面對「陸續進來的 request 流」的三種處理方式
 
-[vLLM-Omni](https://github.com/vllm-project/vllm-omni)（官方專案，本次用 v0.20.0）把 omni 模型拆成多個
-**stage**，每個 stage 由不同型別的 engine 跑：
+LLM 推論分兩階段：**prefill**（把 prompt 一次算完、得到第一個 token）和 **decode**（一次產生一個 token、反覆做到
+EoS）。decode 每產生一個 token，GPU 都要把**整顆模型權重從 HBM 讀一遍**做矩陣乘法——這是**記憶體頻寬瓶頸**：
+算術量小、要搬的權重 bytes 大。**關鍵：這一次權重讀可以同時服務一整個 batch 裡的所有序列**——batch 裡有 N 條一起
+decode，那一次權重讀就同時推進了 N 個 token。所以「把同時段的 request 併在一起算」對吞吐 / 省頻寬是巨大的槓桿；
+而**何時能把一條 request 併進正在算的 batch**，就決定了它要等多久才聽到第一個字。據此分三種：
 
-| Stage | 角色 | Engine 型別 |
-|---|---|---|
-| 0 Thinker | 多模態理解 + 文字生成（自回歸） | 標準 vLLM AR engine |
-| 1 Talker | 文字 embedding → RVQ 語音碼（自回歸） | 標準 vLLM AR engine |
-| 2 Code2Wav | RVQ 碼 → 音訊波形 | 一個輕量 causal ConvNet |
+### (1) No batching（`max_num_seqs=1`）—— 最差
+一次只算一條 request、FCFS 排隊。一條 request 到達時若引擎正在算別的，它就**從頭等到那條整個算完**。每一條都在
+等前一條。權重讀只服務 1 條序列，GPU 多數時間在「為一條序列搬整顆模型」。這是最樸素的 `model.generate(單條)`
+迴圈，也是這次的最差基準。
 
-**continuous batching 就活在每個 AR stage 的 vLLM scheduler 裡**：
-- `waiting` queue（新進來 / 被搶占的 request）、`running` queue（正在 decode 的）；
-- 每個 step 呼叫一次 `schedule()` 重排 running batch；某條 seq 打到 EoS 就從 running queue 移除、釋出結果；
-- `max_num_seqs` / `max_num_batched_tokens` 控批量上限（vLLM-Omni 的 stage deploy schema 裡 AR stage 的
-  `max_num_seqs` 預設 64）。
+### (2) Static / 固定 batch（典型 NPU 為主、靜態圖的運算體驗）
+湊一批（上限 B）一起送進去算。**這一批一旦開跑，形狀就定死了——跑中不能再加進新的 request**；某條先算到 EoS 的
+結果可以先串流出來（那只是 detokenize / 收尾），但**它空出來的 slot 在這一批沒整個排空之前不能給別人用**；要等
+整批排空，才會用 queue 裡累積的 request 湊出下一批。
 
-所以「框架支不支援」這題的答案是**支援**；剩下的就是在 5090 上跑出來、量出差異。
+這是很多 **NPU runtime、靜態 graph 編譯（TensorRT static engine 等）、以及不少邊緣裝置上的推論棧** 的真實情況：
+batch 維度在編譯 / 啟動時就固定了，runtime 沒有「在第 k 步把第 N+1 條 request 塞進 batch」這種能力。所以它**拿到了
+「一波裡多條一起算」的省頻寬好處（這比 (1) 好很多）**，但代價是：**一個在某一波算到一半時才到的 request，要等
+那一整波排空才能開始**——按下說話到聽到反應，平均 ≈ 半個批～一個批的長度。它**夾在 (1) 與 (3) 中間**。
+
+### (3) Continuous / in-flight batching（vLLM / vLLM-Omni 的做法）—— 我們提的
+scheduler **每一個 decode step 都重新排程**：哪一條打到 EoS，這個 step 結束就把它移出 running batch、結果立刻釋出；
+哪一條新 request 在 waiting queue 裡，**下一個 step 就把它併進正在算的 batch**；空出的 slot 立刻被等待中的 request
+補上。running batch 隨時動態填到上限 B。→ 新 request ≈ 一個 prefill 就吐第一個字（不用等任何「批」），先算完的
+立刻交還結果、下一個輸入隨時可進；同時 GPU 一直滿載、權重讀一直被攤提到很多條序列。
 
 ---
 
-## 3. 實驗環境
+## 2. vLLM-Omni 支援 (3) —— 已確認
+
+vLLM-Omni 把 omni 模型拆成多個 stage（Thinker / Talker / Code2Wav），每個自回歸（AR）stage 各跑一個**標準 vLLM
+engine**；continuous batching 就住在那個 AR scheduler 裡：`waiting` / `running` queue、每 step 呼叫一次
+`schedule()` 重排 running batch、某條打到 EoS 就從 running queue 移除釋出、`max_num_seqs` / `max_num_batched_tokens`
+控批量上限（AR stage 預設 `max_num_seqs=64`）。官方專案 <https://github.com/vllm-project/vllm-omni>，文件
+<https://docs.vllm.ai/projects/vllm-omni/>。
+
+所以「框架支不支援 (3)」答案是**支援**。本文要做的是把 (1)/(2)/(3) 三者在同一台機器上跑出來、量出體驗差。
+
+---
+
+## 3. 實驗設定
 
 | 項目 | 值 |
 |---|---|
 | GPU | NVIDIA GeForce RTX 5090, Blackwell, **sm_120**, 32 GB |
-| Driver / CUDA | 580.95 / driver 報 CUDA 13.0 |
-| Python env | conda `vllm_omni`（Python 3.12） |
-| 套件 | `vllm==0.20.0`（cu130 prebuilt wheel，**含 sm_120**，不需自己編 kernel）+ `vllm-omni==0.20.0`（純 Python plugin）+ matplotlib |
-| 模型 | `Qwen3-Omni-30B-A3B-Instruct-AWQ-4bit`（compressed-tensors, pack-quantized int4, group_size 32；30B 總參數、每 token 只 active ~3B 的 MoE） |
-| 服務方式 | `vllm serve <model> --max-num-seqs <N> --limit-mm-per-prompt '{"image":0,"video":0,"audio":0}' --skip-mm-profiling`（text-only），OpenAI 相容 API on `:8901` |
-| 推論引擎內部數字 | Thinker 權重 ≈ 20 GB，KV cache ≈ 11 GB（≈ 120k tokens，≈ 14.6× 並發），CUDA graph 開 |
+| 環境 | conda `vllm_omni`（Python 3.12）；`vllm==0.20.0`（cu130 prebuilt wheel，含 sm_120，不需自己編 kernel）+ `vllm-omni==0.20.0` |
+| 模型 | `cpatonn/Qwen3-Omni-30B-A3B-Instruct-AWQ-4bit`（HF；compressed-tensors, int4, group_size 32；30B 總參數、每 token 只 active ~3B 的 MoE） |
+| 服務 | `vllm serve <model> --max-num-seqs 32 --limit-mm-per-prompt '{"image":0,"video":0,"audio":0}' --skip-mm-profiling`（text-only）；OpenAI 相容 API on `:8901`。plain `vllm serve` 會把 `Qwen3OmniMoeForConditionalGeneration` 映射成只出文字的 **Thinker** → 只載 ~20 GB 權重、KV cache 拿滿 ~11 GB（≈ 120k tokens）。這個 Thinker AR engine 就是 vLLM-Omni stage-0 內部用的同一套 vLLM engine。 |
 
-### 為什麼是「Thinker 經由 `vllm serve`」而不是完整 omni pipeline？
+**三種模式怎麼跑（同一個 server，差異全做在 client 端的「進場 / 補位規則」）：**
+vLLM 的 V1 engine 永遠是 continuous batching、沒有「靜態 batch」開關。所以我們把 server 用一個夠大的
+`max_num_seqs=32` 起起來（不會是瓶頸），三種模式都是 **client 端的 admission controller**——這樣三者唯一的變數就是
+排程策略，模型 / server / 負載 / 每個 request 的取樣 seed 完全一致：
 
-Qwen3-Omni-30B-A3B 的完整三段 pipeline（Thinker+Talker+Code2Wav）官方 deploy config 標明是在 **2× H100-80G**
-上驗證的（stage 0 一張卡、stage 1+2 另一張卡）。三段全擠到單卡 32 GB 會 OOM —— Thinker 一個 stage 就吃 ~20 GB
-權重，剩不到 ~10 GB 給 Talker + Code2Wav。而 **continuous batching 的行為完全活在 AR scheduler 裡，跟 audio
-那兩段無關**。
+| mode | 同時在跑的上限 | 補位規則（某條算完、空出 slot 後） |
+|---|--:|---|
+| `none` | 1 | 等這 1 條算完，才送下一條（≡ `max_num_seqs=1` 的 server） |
+| `static` (B=8) | 8 | 這一波 ≤8 條**全部排空**（in-flight→0）後，才從 queue 取下一波 ≤8 條；波進行中新 request 一律等 |
+| `continuous` (B=8) | 8 | 任一條算完、in-flight<8 的瞬間，**立刻**從 queue 補一條進來（≡ vLLM continuous batching, cap 8） |
 
-剛好 plain `vllm serve <Qwen3-Omni 模型>` 會把 arch `Qwen3OmniMoeForConditionalGeneration` 映射到
-`Qwen3OmniMoeThinkerForConditionalGeneration`（只出文字、不生音訊），所以只載 ~20 GB Thinker 權重、KV cache
-拿滿 ~11 GB，單卡就放得下。**這個 Thinker AR engine 就是 vLLM-Omni stage-0 內部用的同一套 vLLM engine**，
-所以這裡量到的 continuous batching 行為 ＝ 你在 vLLM-Omni 的 Thinker stage 會看到的行為。
+每個 request 記：`t_submit`（到達 / 進 client queue）、`t_admitted`（離開 queue、實際開始）、`t_first_token`
+（→ TTFT = first_token − submit，含 client 排隊 + server prefill）、`t_finish`（EoS、結果整段釋出）、`wave_id`
+（屬第幾波，static 模式）。負載：proactive 每 2.5s（≤220 tok）、interactive Poisson ~1.6/s（≤180 tok）、24 秒窗；
+另有飽和爆量（24 條一瞬間進來，各 ≤160 tok）。三種模式各跑一次，同一個 `--seed`。
 
-> 安裝小坑（記錄給未來）：vLLM 0.20.0 的 PyPI wheel 是 **CUDA 13** build（需要 `torch==2.11.0+cu130`），
-> 別用 `uv pip install ... --torch-backend=auto`（uv 只認到 cu128，會給 `torch==2.11.0+cu128`，造成
-> `libcudart.so.13: cannot open shared object file`）；直接 `pip install "vllm==0.20.0"` 讓它解預設 PyPI 的
-> `torch==2.11.0`（已是 cu13 build）即可。另外 torch 2.11 / sm_120 上 omni 的 multimodal *profiling* 路徑有個
-> Triton codegen 小毛病，`--skip-mm-profiling` 可繞過（我們本來就只跑 text，不受影響）。
-
----
-
-## 4. 實驗設計
-
-整個實驗只有**一個變數**：server 啟動時的 `--max-num-seqs`。
-- `max_num_seqs=1` ＝ **「沒有 continuous batching」**：vLLM 仍然是 iteration-level 排程，但 running batch 最多 1 條
-  → request 排隊、FCFS、一個一個算到完才換下一個。這完全等同於最樸素的 `model.generate()` 一條一條跑的迴圈，
-  是業界示範 continuous batching 價值的標準對照組。
-- `max_num_seqs=16` ＝ **「有 continuous batching」**：running batch 隨時可填到 16 條。
-
-兩個 config 各重啟一次 server，然後用同一支腳本（固定隨機種子 → 兩次的 request 到達時間完全一樣，比較才公平）
-跑兩個情境：
-
-### 情境 A：車艙情境（接近真實負載）—— 看「體驗 / 延遲」
-
-`cabin_demo.py` 用 asyncio 同時跑兩條 request 流，**打同一個 engine**：
-- **「主動偵測」流**：每 **2.5 秒**送一次，system prompt 要求輸出「【觀察】兩三句 + 【動作】一行 JSON +
-  【理由】兩三句 + 【後續】一句」，最多 220 tokens（場景例如「駕駛連打三個噴嚏、車內 18°C、後排窗微開」）。
-- **「交互對話」流**：以 **Poisson 過程（平均 ~1.6 次/秒）** 在隨機時間點送，使用者口語問句（路線、休息、關窗、
-  四川話、副駕調溫…），最多 180 tokens。
-- 送 request 的時間窗 24 秒，共產生約 30 個交互 + 10 個主動偵測 request。
-
-每個 request 都記錄四個時間戳：
-| 欄位 | 意義 |
-|---|---|
-| `t_submit` | 送出 request 的時間 |
-| `t_first_token`（→ **TTFT** = `t_first_token − t_submit`） | 收到第一個 token —— **使用者「看到 / 聽到」反應的時刻** |
-| `t_finish` | 收到 EoS、結果整段釋出的時刻（→ 端到端延遲 = `t_finish − t_submit`） |
-| `n_out_tokens` | 產生的 token 數 |
-
-`t_submit → t_first_token` 這段就是「**在 engine 裡排隊 + prefill、使用者還沒看到任何字**」的時間。
-有沒有 continuous batching，差別主要就體現在這段。
-
-### 情境 B：飽和爆量（saturated burst）—— 看「吞吐 / 省頻寬」
-
-`cabin_demo.py --burst 24`：在同一瞬間丟 24 個 request（模擬「這一 tick 有一大堆東西要處理」），不跑主動偵測，
-量「24 個全部算完要多久」「總輸出 tokens / 忙碌區間 ＝ 吞吐」以及每個 request 的 TTFT。
-- 有 batching：24 個（最多 16 個同時）一起 decode，一次權重讀服務一大把 → 吞吐高、總耗時短、TTFT 都很小。
-- 沒有 batching：24 個排隊、一個一個跑到完 → 吞吐 ＝ 單條速度、總耗時長、第 N 個的 TTFT ≈ 前 N−1 個的總算時。
+**這個 emulation 公不公平 / 忠實嗎？**
+- mode (1) / (3) **完全重現**真實 `max_num_seqs=1` / `=B` server 的行為 —— cross-check：先前用真實 `max_num_seqs=1`
+  server 跑同樣負載得交互 TTFT p50 **946 ms**（這次 emulated `none` 得 1 020 ms，同量級、差異來自 run-to-run 與
+  seeded vs 非 seeded 的輸出長度抖動）；真實 `max_num_seqs=16` server 得 **19 ms**（這次 emulated `continuous` B=8
+  得 18 ms，幾乎一樣——本負載下引擎一直有空 slot，補位的網路 RTT 直接算進 prefill 量測裡，可忽略）。見附錄。
+- mode (2) 是 NPU 為主 / 靜態圖的合理模型。emulation 唯一**對 mode (2) 偏寬鬆**的兩處：(a) vLLM 在底下會把跑中的
+  batch 隨 seq 結束**縮小**，所以不浪費算力、且這一波最長那條的尾段會稍快（真實靜態 batch 會把 batch 維持在 B、
+  長尾那條全程慢速）；(b) 我們用最寬鬆的「引擎一空就把 queue 裡的人湊一波開跑」，沒有額外「等湊滿 B 或 timeout」
+  的批集延遲。→ 量到的 mode (2) 延遲是「真實 NPU 停頓」的**下界**；質性上「整批算完才放下一批」忠實。
 
 ---
 
-## 5. 結果與怎麼看出差異
+## 4. 結果與怎麼看出差異
 
-### 5.1 怎麼讀時間軸圖
+### 4.1 怎麼讀時間軸圖
 
-兩張圖都是「左 ＝ 沒有 continuous batching、右 ＝ 有」並排，x 軸是 wall-clock 秒數，**一列一個 request**
-（依送出順序由上到下）：
-- **淺色** 段（`t_submit → t_first_token`）＝ 在 engine 裡**排隊 + prefill**，使用者**還沒看到任何字**（這段就是 TTFT）；
-- **深色** 段（`t_first_token → t_finish`）＝ **正在吐 token / 串流回覆**；
-- 黑色 **`|`** ＝ **第一個 token 送達**的那一刻；
-- 橘色 ＝ 主動偵測 request，藍色 ＝ 交互 request；交互那列右邊標的 ms 數字 ＝ 它的 TTFT。
+三個 panel 並排（(1) no batching / (2) static / (3) continuous），x 軸是 wall-clock 秒、一列一個 request（依到達順序）：
+- **淺色**段 `t_submit → t_first_token` ＝ 在 queue 裡排隊 + prefill，使用者**還沒看到任何字**（這段長度就是 TTFT）；
+- **深色**段 `t_first_token → t_finish` ＝ **正在吐 token / 串流回覆**；
+- 黑色 **`|`** ＝ 第一個 token 送達；橘色 ＝ 主動偵測 request、藍色 ＝ 交互 request；
+- (2) static panel 的**淡色虛線** ＝ 一個「波」的開始（`w0`、`w1`、…）；交互那列右邊的 ms / s ＝ 它的 TTFT。
 
-### 5.2 情境 A：車艙情境
+### 4.2 情境 A：車艙情境
 
-![cabin timeline](results/timeline_cabin.png)
+![cabin 3-way timeline](results/timeline_3way.png)
 
-**左邊（沒有 continuous batching, `max_num_seqs=1`）**：交互 request 普遍拖著一條很長的**淺色尾巴** ——
-它們卡在 queue 裡等前面那個（常常是正在跑的主動偵測或前一個交互）算完，TTFT 中位數 **946 ms**、p95 **2.24 秒**、
-最差 **2.36 秒**。連主動偵測自己也會被前面排隊的交互拖到，端到端最差 **2.19 秒**（正常 ~0.7 秒）。
+- **(1) no batching**：每個交互 request 拖著一條很長的淺色尾巴——它卡在 queue 裡等前面那個（常是正在算的主動偵測或
+  前一個交互）整個算完。TTFT 中位數 **1.02 秒**、p95 **2.10 秒**、最差 **2.13 秒**。連主動偵測自己也被前面排隊的交互
+  拖到，端到端最差 **1.99 秒**（正常 ~0.65 秒）。
+- **(2) static (B=8)**：bar 都從某條淡色虛線（波界）開始——一個在某波算到一半時才到的 request，要等那一整波排空才被
+  湊進下一波。它**拿到了「一波多條一起算」的好處**（一波 ≤8 條同時 decode，所以比 (1) 快很多），但 TTFT 仍被「等上一波
+  排空」墊高：中位數 **199 ms**、p95 **561 ms**、最差 **602 ms**。比 (1) 快 ~11 倍，但比 (3) 慢 ~11 倍。
+- **(3) continuous (B=8)**：淺色尾巴幾乎看不到——交互 request 在主動偵測（或別的交互）算到一半時就**併進同一個
+  batch**，TTFT 中位數 **18 ms**、p95 **25 ms**、最差 **27 ms**；主動偵測完全不受影響繼續跑（端到端最差 0.89 秒）。
 
-**右邊（有 continuous batching, `max_num_seqs=16`）**：淺色尾巴幾乎看不到 —— 每個交互 request 在主動偵測（或別的
-交互）decode 到一半時就**併進同一個 batch**，TTFT 中位數 **19 ms**、p95 **27 ms**、最差也只有 **67 ms**。
-主動偵測完全不受影響、繼續按它的節奏跑（端到端最差 0.81 秒）。
+#### log 對照（同一個時刻，三種行為）
 
-| 指標 | 沒有（seqs=1） | 有（seqs=16） | 倍數 |
-|---|--:|--:|--:|
-| 交互 TTFT p50 | 946 ms | **19 ms** | **≈ 50×** |
-| 交互 TTFT p95 | 2 239 ms | **27 ms** | **≈ 83×** |
-| 交互 TTFT 最差 | 2 357 ms | 67 ms | ≈ 35× |
-| 交互 端到端 p50 | 1 114 ms | 430 ms | ≈ 2.6× |
-| 主動偵測 端到端 最差 | 2 192 ms | 806 ms | ≈ 2.7× |
-
-> 注：這個負載沒把 GPU 餵滿（每 2.5s 一次主動偵測 + 稀疏的交互 burst），所以兩邊的「整段平均吞吐」差不多
-> （158 vs 164 tok/s）—— 這個情境要看的是**延遲 / 體驗**，不是吞吐。吞吐的差異看情境 B。
-
-#### log 對照（同樣的時刻，一個排隊、一個秒進）
-
-**沒有 continuous batching** —— 交互 #5 送出後得等正在跑的主動偵測 #1 算完，**等了 1058 ms 才吐第一個字**：
+**(2) static** —— t=3.47s 形成 wave #5（4 條）；interactive #5 在 queue 裡等了 440 ms、#6 等 156 ms、#7 等 119 ms，
+它們**一起在波界開始**（連一個主動偵測 #1 也被卡在這個波界等了 471 ms）：
 ```
-[t=  3.80s] interactive #8  submitted
-[t=  3.82s] interactive #9  submitted
-[t=  4.07s] proactive   #1  DONE  (136 tok, e2e  1.07s, ...)   ← 主動偵測這一輪算完，queue 才輪到交互
-[t=  4.09s] interactive #5  first token (waited   1058 ms after submit)
-[t=  4.14s] interactive #5  DONE  ( 15 tok, e2e  1.11s, ...)
+[t=  3.35s] interactive #7  arrived    (pending 4, in-flight 1)        ← 此刻 wave #4 還在跑，#7 不能加入
+[t=  3.47s] interactive #4  DONE  (138 tok, ...)                       ← wave #4 整個排空
+[t=  3.47s] --- wave #5: admitting 4 req (pending was 4) ---           ← 才湊出下一波
+[t=  3.47s] proactive   #1  admitted   (waited    471 ms in client queue, wave #5)
+[t=  3.47s] interactive #5  admitted   (waited    440 ms in client queue, wave #5)
+[t=  3.47s] interactive #6  admitted   (waited    156 ms in client queue, wave #5)
+[t=  3.47s] interactive #7  admitted   (waited    119 ms in client queue, wave #5)
+[t=  3.49s] interactive #7  first token (TTFT    140 ms = 119 queue + 21 prefill)
 ```
 
-**有 continuous batching** —— 主動偵測 #1 還在跑（t=3.02 才吐第一個字），t=3.03 進來的交互 #5 **下一個 step 就併進去**，
-26 ms 吐第一個字、t=3.15 就算完釋出；接著 #6 #7 也一樣秒進；主動偵測 #1 完全不受干擾，t=3.63 自己算完：
+**(3) continuous** —— 同一個負載的同一個時刻：主動偵測 #1 還在跑（t=3.02 才吐第一個字），t=3.03 進來的 interactive #5
+**下一個 step 就被併進去**，25 ms 吐第一個字、t=3.30 就算完釋出；#6、#7 同樣秒進；主動偵測 #1 完全不受干擾，t=3.73 自己算完：
 ```
-[t=  3.00s] proactive   #1  submitted
-[t=  3.02s] proactive   #1  first token (waited     18 ms after submit)
-[t=  3.03s] interactive #5  submitted               ← 在主動偵測 decode 到一半時進來
-[t=  3.06s] interactive #5  first token (waited     26 ms after submit)   ← 直接併入正在跑的 batch
-[t=  3.15s] interactive #5  DONE  ( 21 tok, e2e  0.12s, ...)              ← 打到 EoS 立刻釋出
-[t=  3.32s] interactive #6  submitted
-[t=  3.33s] interactive #6  first token (waited     17 ms after submit)
-[t=  3.35s] interactive #7  submitted
-[t=  3.38s] interactive #7  first token (waited     23 ms after submit)
-[t=  3.63s] proactive   #1  DONE  (124 tok, e2e  0.63s, ...)             ← 主動偵測完全不受影響
+[t=  3.02s] proactive   #1  first token (TTFT     15 ms = 0 queue + 15 prefill)
+[t=  3.03s] interactive #5  arrived    (pending 1, in-flight 2)
+[t=  3.03s] interactive #5  admitted   (waited      0 ms in client queue)   ← 直接併入正在跑的 batch
+[t=  3.06s] interactive #5  first token (TTFT     25 ms = 0 queue + 25 prefill)
+[t=  3.30s] interactive #5  DONE  ( 51 tok, e2e  0.27s, ...)                ← 打到 EoS 立刻釋出
+[t=  3.33s] interactive #6  first token (TTFT     16 ms = 0 queue + 16 prefill)
+[t=  3.37s] interactive #7  first token (TTFT     20 ms = 0 queue + 20 prefill)
+[t=  3.73s] proactive   #1  DONE  (137 tok, e2e  0.73s, ...)                ← 主動偵測完全不受影響
 ```
 
-### 5.3 情境 B：飽和爆量（24 個 request 同一瞬間進來）
+**(1) no batching** —— interactive #11 在 queue 裡等了 **1800 ms**（卡在 #10 後面，#10 跑到 t=6.02 才結束），TTFT 1812 ms：
+```
+[t=  6.02s] interactive #10 DONE  (135 tok, e2e  1.84s, ...)
+[t=  6.02s] interactive #11 admitted   (waited   1800 ms in client queue, wave #13)
+[t=  6.03s] interactive #11 first token (TTFT   1812 ms = 1800 queue + 12 prefill)
+```
 
-![burst timeline](results/timeline_burst.png)
+### 4.3 情境 B：飽和爆量（24 條一瞬間進來）
 
-（注意左右兩張圖的 x 軸刻度不一樣 —— 左邊到 ~10 秒，右邊到 ~2.5 秒。）
+![burst 3-way timeline](results/timeline_3way_burst.png)
 
-**左邊（沒有, seqs=1）**：一條**樓梯狀** —— 24 個 request 排隊，一個一個算到完才換下一個。第 1 個很快，但越後面
-等越久，最後一個**等了 8.6 秒**才吐第一個字。24 個全部算完花 **9.2 秒**，輸出吞吐 **239 tok/s**（＝單條 decode 速度）。
+（三個 panel 的 x 軸刻度不同 —— (1) 到 ~10 秒、(2)(3) 到 ~3 秒。）
 
-**右邊（有, seqs=16）**：24 個 request **幾乎同時開跑**（t≈1.0s），一起 decode、一起串流，**1.5 秒**就全部算完。
-輸出吞吐 **1 456 tok/s** —— 同樣的權重讀，現在一次服務一大把序列。TTFT 中位數 52 ms、最差 583 ms（後面 8 個排在前
-16 個之後，但前面的一打到 EoS 它們馬上補上）。
+- **(1) no batching**：一條樓梯——24 條排隊、一個一個算到完。第 1 個快、越後面等越久，最後一個**等了 8.86 秒**才吐第一個字；
+  24 個全部算完花 **9.16 秒**；輸出吞吐 **238 tok/s**（＝單條 decode 速度）。
+- **(2) static (B=8)**：3 個波（圖上 `w0`/`w1`/`w2` 三道虛線）——8 條一波一起算、整批排空才開下一波。波 0 的 TTFT ≈ 一個
+  8-way prefill（~0.6 秒），波 1 還要再加「等波 0 排空」（~0.9 秒），波 2 再加一層（~1.6 秒）；24 個全部算完 **2.46 秒**；
+  吞吐 **863 tok/s**（≈ 單條的 3.6×）。
+- **(3) continuous (B=8)**：8 條先開跑，**任一條打到 EoS 就立刻補一條**進來——所以短的（如那句四川話 ~15 tokens）一算完，
+  排隊中的下一條馬上接上。TTFT p50 **641 ms**、最差 **1.41 秒**；24 個全部算完 **1.90 秒**；吞吐 **1 083 tok/s**（≈ 單條的 4.5×）。
 
-| 指標 | 沒有（seqs=1） | 有（seqs=16） | 倍數 |
-|---|--:|--:|--:|
-| **輸出吞吐（忙碌區間）** | **239 tok/s** | **1 456 tok/s** | **≈ 6.1×** |
-| 24 個全部算完耗時 | 9.16 s | 1.47 s | ≈ 6.2× |
-| 交互 TTFT p50 | 4 499 ms | 52 ms | ≈ 87× |
-| 交互 TTFT p95 | 8 209 ms | 557 ms | ≈ 15× |
-| 交互 端到端 p50 | 4 923 ms | 819 ms | ≈ 6.0× |
-
----
-
-## 6. 為什麼是這些倍數？
-
-- **TTFT 改善（~50×、爆量時 ~87×）**：純粹來自**不用排隊**。沒有 continuous batching 時，新 request 必須等
-  目前正在跑的那條（或前面排隊的那些）算到完；有的話，它下一個 decode step 就被併進正在跑的 batch，
-  TTFT ≈ 一次 prefill（這顆模型的短 prompt prefill 只要 ~20 ms）。
-- **吞吐 / 省頻寬改善（~6×）**：decode 是記憶體頻寬瓶頸 —— 每個 step 都要把整顆模型權重從 HBM 讀一遍。
-  沒有 batching 時這一次讀只推進 1 個 token；batch 16 時同一次讀推進 16 個 token → 同樣的權重 bytes 做了
-  約 6 倍的有效工作（239 → 1456 tok/s）。**這就是「省頻寬」的具體含義。**
-- **為什麼不是 16×？** 因為 (1) batch 16 時模型已部分變成 compute-bound（每 step 的矩陣乘法量變大），
-  per-seq 速度從 ~248 tok/s 掉到 ~145 tok/s；(2) 這顆 30B-A3B 是每 token 只 active ~3B 的 MoE，加上 AWQ 4-bit
-  權重 + CUDA graph，**batch=1 的基準本來就已經很快**（~240 tok/s），所以 ratio 看起來「只有」~6×。
-  換成更大、更密（非 MoE）、或更高精度的模型，這個倍數會更接近 batch size，因為 batch=1 時頻寬瓶頸更嚴重。
-- **端到端延遲只改善 ~2.6×**（不像 TTFT 那麼誇張）：因為端到端 = TTFT + decode 時間，而 decode 時間在
-  batch 大時 per-seq 反而略慢（多人分時間片）。對使用者體驗來說，**TTFT 才是「卡不卡」的關鍵**（按下說話多久聽到反應），
-  TTFT 從 ~1 秒降到 ~20 ms 是體感上完全不同的兩件事。
+> 在這個 B=8 + 24 條短 request 的爆量下，(2) 與 (3) 兩者都被「上限只能同時跑 8 條」這個 capacity 卡住，所以差距比情境 A 小
+> （(3) 仍勝在「空出的 slot 立刻補位」而不是「整波排空才補」，省了那些被早早算完、卻空著等整波的 slot）。把 B 調小（如 B=4）
+> 或讓輸出長度更分散，(2)→(3) 的差距會再拉大。
 
 ---
 
-## 7. 體驗是如何 —— 對應到車艙助手場景
+## 5. 體驗 mode by mode（對應車艙助手場景）
 
-把上面的數字翻成使用者視角：
+| | (1) no batching | (2) static / NPU 式 | (3) continuous |
+|---|---|---|---|
+| 平常（主動偵測在跑，使用者插話問問題） | 按下說話 → **等 ~1 秒（最壞 ~2.1 秒）** 才開始有反應；交互的 request 從頭等主動偵測那一輪算完 | 按下說話 → **等 ~0.2 秒（最壞 ~0.6 秒）**；交互的 request 卡在「上一批還沒算完」的批界停頓 | 按下說話 → **~20 ms 就開始回話**；交互的 request 下一個 step 就併進正在跑的 batch |
+| 一下子來很多 request（多位乘客 / 連續追問 / 多攝影機同時觸發 24 件事） | 一個一個排隊，最後那個**等 ~8.9 秒**；全部處理完 ~9.2 秒 | 8 條一波、3 波；最後那個**等 ~1.6 秒**；全部處理完 ~2.5 秒 | 8 條開跑、算完一個補一個；最後那個**等 ~1.4 秒**；全部處理完 ~1.9 秒 |
+| 主動偵測會不會被拖慢 | 會——前面排了交互就得等它們，端到端最差 ~2 秒（正常 ~0.65 秒）→「該關窗了」的動作延遲 | 會一點——也被卡在批界，端到端最差 ~1.1 秒 | 幾乎不會——照自己節奏跑，端到端最差 ~0.9 秒 |
+| GPU 頻寬效率（飽和時的吞吐） | ~238 tok/s（權重讀只服務 1 條） | ~863 tok/s（一波 8 條攤提） | ~1 083 tok/s（隨時填滿、攤提到最多） |
 
-| | 沒有 continuous batching | 有 continuous batching |
-|---|---|---|
-| 平常（主動偵測在跑，使用者插話問問題） | 按下說話 → **等 ~0.9 秒（最壞 ~2.4 秒）** 才開始有反應；因為交互的 request 卡在 queue 裡等主動偵測那一輪算完 | 按下說話 → **~20 ms 就開始回話**；交互的 request 直接併進主動偵測正在跑的 batch |
-| 主動偵測會不會被拖慢 | 會 —— 前面排了交互 request 的話，主動偵測這一輪要等它們，端到端最差被拖到 ~2.2 秒（正常 ~0.7 秒）→ 「該關窗了」的動作延遲 | 不會 —— 主動偵測完全照自己的節奏跑（最差 0.81 秒） |
-| 一下子來很多 request（多位乘客 / 連續追問 / 多支攝影機同時觸發） | 一個一個排隊，最後那個**等 4.5～8.6 秒** | 全部一起算，**~0.05 秒就都開始回**，1.5 秒內全部講完 |
-| GPU 使用效率 / 頻寬 | 多數時間在等、權重讀只服務 1 條 → 同樣的功耗與頻寬做的事少 | 權重讀攤給一大把序列 → 同樣的功耗與頻寬做 ~6× 的事 |
-
-一句話：**沒有 continuous batching，「主動偵測」和「交互對話」會互相卡 —— 主動偵測 4 秒一輪，交互的就得等那一輪；
-有了它，兩者各跑各的、誰先算完誰先把結果交出去，使用者按下說話幾乎是即時回話，而且同一塊 GPU 能撐更多並發。**
+一句話：
+- **沒有 batching**：主動偵測跑一輪、交互就得從頭等那一輪；多件事就一個一個來——體驗最差，GPU 也最浪費。
+- **靜態 / 固定 batch（很多 NPU runtime 的現況）**：拿到了「一波多條一起算」的省頻寬好處，比沒 batching 好很多；但
+  「跑中不能再加進來」這個限制，讓新到的 request 卡在「上一批還沒算完」的批界停頓——按下說話到聽到反應 ≈ 半批～一批的長度。
+- **continuous batching（vLLM-Omni 的做法）**：每個 step 都能吃新進來的 request、誰先算完誰先把結果交出去——交互 ~即時回話、
+  主動偵測互不干擾，而且 GPU 一直滿載、吞吐最高。
 
 ---
 
-## 8. 如何重現
+## 6. 為什麼是這些數字
+
+- **TTFT 改善**：(1)→(2) 來自「不用從頭等前一條，而是搭上一波一起算」；(2)→(3) 來自「不用等整批排空才被湊進下一波，
+  下一個 step 就能加入」。在我們的車艙負載下：(1) 的等待 ≈ 前一條的剩餘時間（~1 秒）；(2) ≈ 當前波排空的剩餘時間
+  （~0.2 秒，波不大）；(3) ≈ 一個 prefill（~20 ms）。
+- **吞吐 / 省頻寬改善**（飽和爆量）：238 → 863 → 1083 tok/s。decode 是頻寬瓶頸，一次權重讀同時推進整個 batch；(1) 每次只
+  推 1 個 token、(2)/(3) 每次推一整波。倍數沒到「等於 batch size」是因為 batch 大時模型已部分變成 compute-bound（per-seq
+  速度從 ~248 掉到 ~170 tok/s），加上這顆 30B-A3B（每 token 只 active ~3B、AWQ 4-bit、CUDA graph）batch=1 的基準本來就快。
+- **為何 mode (2) 在我們這台上「只有」這麼大差距**：decode 太快、B 只取 8、且我們的 emulation 對 mode (2) 偏寬鬆
+  （見 §3）。在真實 NPU 上（batch 維度定死、長尾全程慢速、可能還要等湊滿 batch），mode (2) 的停頓會明顯更嚴重。
+
+---
+
+## 7. 如何重現
 
 ```bash
 cd vllm-omni-continuous-batching   # clone 後的目錄；先 `conda activate vllm_omni`
 
 # 環境（一次性）
 conda create -n vllm_omni python=3.12 -y
-uv pip install --python ~/miniconda3/envs/vllm_omni/bin/python "vllm==0.20.0"      # cu130 prebuilt wheel（含 sm_120）
-uv pip install --python ~/miniconda3/envs/vllm_omni/bin/python "vllm-omni==0.20.0" matplotlib
-#  注意：不要加 `--torch-backend=auto`（會抓到 cu128 的 torch → libcudart.so.13 找不到）
+pip install "vllm==0.20.0"        # cu130 prebuilt wheel（含 sm_120）；不要加 uv 的 --torch-backend=auto（會抓到 cu128 的 torch → libcudart.so.13 找不到）
+pip install "vllm-omni==0.20.0" matplotlib
 
-# --- "沒有" config ---
-MAX_NUM_SEQS=1  bash run_server.sh         # 等 logs/server_seqs1.log 出現 "Application startup complete"
-python cabin_demo.py --config off       --max-num-seqs 1  --out results/run_off.json
-python cabin_demo.py --config off_burst --max-num-seqs 1  --burst 24 --interactive-max-tokens 160 --out results/burst_off.json
-pkill -f "vllm serve"
+# 1) 起一個夠大的 server（modes 都在 client 端 emulate，server 不是瓶頸）
+MAX_NUM_SEQS=32 bash run_server.sh           # 等 logs/server_seqs32.log 出現 "Application startup complete"
 
-# --- "有" config ---
-MAX_NUM_SEQS=16 bash run_server.sh
-python cabin_demo.py --config on        --max-num-seqs 16 --out results/run_on.json
-python cabin_demo.py --config on_burst  --max-num-seqs 16 --burst 24 --interactive-max-tokens 160 --out results/burst_on.json
-pkill -f "vllm serve"
+# 2) 車艙情境（同一個 --seed → 三次到達時間/取樣完全一樣）
+python cabin_demo.py --mode none       --batch-size 1 --max-num-seqs 32 --out results/run_none.json
+python cabin_demo.py --mode static     --batch-size 8 --max-num-seqs 32 --out results/run_static.json
+python cabin_demo.py --mode continuous --batch-size 8 --max-num-seqs 32 --out results/run_continuous.json
 
-# --- 畫圖 + 列對比表 ---
-python plot_timeline.py --off results/run_off.json   --on results/run_on.json   --out results/timeline_cabin.png
-python plot_timeline.py --off results/burst_off.json --on results/burst_on.json --out results/timeline_burst.png \
-    --title "Saturated burst — 24 requests submitted at once to one vLLM-Omni engine"
+# 3) 飽和爆量（24 條一瞬間進來）
+for m in none static continuous; do B=8; [ "$m" = none ] && B=1; \
+  python cabin_demo.py --mode $m --batch-size $B --max-num-seqs 32 --burst 24 --interactive-max-tokens 160 --out results/burst_$m.json; done
 
-# --- (選用) 用 vLLM 內建 benchmark 跑 concurrency sweep ---
-bash bench_sweep.sh    # server 起好後跑；再用 MAX_NUM_SEQS=1 起一次、再跑一次當 baseline
+# 4) 畫圖 + 列三欄表
+python plot_timeline.py --panels results/run_none.json results/run_static.json results/run_continuous.json --out results/timeline_3way.png
+python plot_timeline.py --panels results/burst_none.json results/burst_static.json results/burst_continuous.json --out results/timeline_3way_burst.png
 ```
 
-`cabin_demo.py` 主要參數：`--duration`、`--proactive-interval`、`--proactive-max-tokens`、`--interactive-rate`（Poisson req/s）、
-`--interactive-max-tokens`、`--n-interactive`（上限）、`--burst N`（飽和模式）、`--seed`。
+`cabin_demo.py` 主要參數：`--mode {none,static,continuous}`、`--batch-size B`、`--duration`、`--proactive-interval`、
+`--proactive-max-tokens`、`--interactive-rate`（Poisson req/s）、`--interactive-max-tokens`、`--n-interactive`、
+`--burst N`（飽和模式：N 條一次到達、不跑主動偵測）、`--seed`。
 
 ---
 
-## 9. 限制與注意事項
+## 8. 限制與注意事項
 
-- **完整 omni pipeline（含語音輸出）需要 ≥ 2 張 80 GB 等級的卡** —— 本文只示範 Thinker（AR 文字核心，
-  也就是 continuous batching 真正住的地方）；audio 的 Talker / Code2Wav 不在 continuous-batching 這個題目的範圍內。
-  （vLLM-Omni 0.20.0 本身在這台 5090 上**裝得起來、會載入**，只是三段擠單卡 32 GB 會 OOM。）
-- **`max_num_seqs` 是 server 啟動時的參數** —— 兩個 config 要分別重啟 server；`cabin_demo.py --seed` 固定 →
-  兩次 request 的到達時間一樣，比較才公平。
-- **這台機器上其他程序也會搶 GPU**（如 ollama 的 `qwen3-vl:8b` 偶爾被觸發、會佔 ~26 GB）；server 起不來 OOM 時，
-  先 `nvidia-smi --query-compute-apps` / `ollama ps` 看誰在佔。
-- 數字是這顆特定模型（30B-A3B MoE, AWQ-4bit）在這台 5090 上的結果；換模型 / 量化 / GPU，**絕對值會變，但
-  「有 continuous batching → TTFT 大幅下降、吞吐大幅上升」這個趨勢不變**（continuous batching 是 scheduler 的特性，與模型架構無關）。
+- 完整 omni pipeline（含語音輸出 Talker + Code2Wav）官方 deploy config 是在 **2× H100-80G** 上驗證的；單卡 32 GB
+  放不下三段，所以本文只示範 **Thinker**（AR 文字核心，也就是 continuous batching 真正住的地方）。
+- mode (2)「static」是 NPU 為主 / 靜態圖的**合理模型**，emulation 對它偏寬鬆（見 §3）→ 量到的差距是下界；要做更「純」的
+  版本可用 offline `LLMEngine.step()`（自己 `add_request` 控制批的形成）。
+- mode (3)「continuous」用 client 端 cap=B emulate（補位多一個 ~ms 級網路 RTT）；cross-check 對真實 `max_num_seqs` server
+  的數字幾乎一樣（見附錄）。
+- 數字是這顆模型（30B-A3B MoE, AWQ-4bit）在這台 5090、這份負載下的結果；換模型 / 量化 / GPU / 負載，**絕對值會變，
+  但「no batching < static < continuous」的順序與「TTFT 大幅下降、吞吐大幅上升」的趨勢不變**——continuous batching 是
+  scheduler 的特性，與模型架構無關。
+- server 跑起來佔 ~30 GB GPU；用完 `pkill -f "vllm serve"`。這台機器上其他程序（如 ollama）也可能搶 GPU，server 起不來
+  OOM 時先 `nvidia-smi --query-compute-apps`。
 
 ---
 
-*產出檔案見 `results/`（4 份逐 request JSON + 2 張時間軸 PNG）、`logs/`（各次 server 的完整 log，含 KV cache 大小、
-並發上限等）。腳本見 `run_server.sh` / `cabin_demo.py` / `plot_timeline.py` / `bench_sweep.sh`。*
+## 附錄：emulation 對真實 server 的 cross-check（第一階段資料）
+
+第一階段直接用真實的 `vllm serve --max-num-seqs N` 跑過同樣的車艙負載：
+
+| | 真實 server | 對應本文 emulated 模式 |
+|---|--:|---|
+| `max_num_seqs=1`（真 FCFS）→ 交互 TTFT p50 | **946 ms** | `none`：1 020 ms ✓ 同量級 |
+| `max_num_seqs=16`（真 continuous）→ 交互 TTFT p50 | **19 ms** | `continuous` (B=8)：18 ms ✓ 幾乎一樣 |
+
+也就是說 client 端的 admission emulation 在 (1) 與 (3) 兩端與真實 server 對得上；(2)「static」沒有對應的 server flag
+（vLLM V1 永遠 continuous），是用「同 server + client 端不在波結束前送下一條」忠實還原 NPU 式的固定批行為。
+
+*產出檔案：`results/run_{none,static,continuous}.json`、`results/burst_{none,static,continuous}.json`（逐 request 資料 +
+summary）、`results/timeline_3way.png`、`results/timeline_3way_burst.png`；`logs/server_seqs32.log`（server 完整 log）。
+腳本：`run_server.sh` / `cabin_demo.py` / `plot_timeline.py` / `bench_sweep.sh`。*
