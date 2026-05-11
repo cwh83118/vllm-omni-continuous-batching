@@ -1,0 +1,11 @@
+# server logs (regenerable; contain local paths)
+logs/
+*.log
+
+# python
+__pycache__/
+*.pyc
+
+# editor / OS
+.claude/
+.DS_Store
