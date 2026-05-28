@@ -1,0 +1,4 @@
+precision,experts_GiB,attention_GiB,router_GiB,embed_lmhead_GiB,total_weights_GiB,experts_pct_of_params,experts_pct_of_bytes
+bf16,54.0,1.688,0.023,1.159,56.87,94.95,94.95
+fp8,27.0,0.844,0.012,0.58,28.435,94.95,94.95
+int4_awq_g32,15.609,0.488,0.007,1.159,17.263,94.95,90.42

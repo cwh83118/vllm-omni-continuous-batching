@@ -1,0 +1,277 @@
+{
+  "arch": {
+    "name": "Qwen3-Omni-30B-A3B-Thinker",
+    "num_layers": 48,
+    "hidden": 2048,
+    "num_q_heads": 32,
+    "num_kv_heads": 4,
+    "head_dim": 128,
+    "moe_intermediate": 768,
+    "num_experts": 128,
+    "top_k": 8,
+    "has_shared_expert": false,
+    "vocab": 151936,
+    "tie_word_embeddings": false
+  },
+  "anchors": {
+    "B1_agg_tok_s": 238.0,
+    "B8_agg_tok_s": 1083.0,
+    "B1_ttft_p50_ms": 4359.0,
+    "B8_ttft_p50_ms": 641.0,
+    "hbm_peak_GBps": 1792.0
+  },
+  "calibration": {
+    "eff_BW_GBps_at_B1": 523.813126144,
+    "eff_BW_GBps_at_B8": 1041.75262374,
+    "MBU_at_B1": 0.292306432,
+    "MBU_at_B8": 0.5813351694977679,
+    "fit_a_GBps": 523.813126144,
+    "fit_b_GBps_per_log2B": 172.64649919866667,
+    "hbm_peak_GBps": 1792.0
+  },
+  "params": {
+    "experts": 28991029248,
+    "attention": 905969664,
+    "router": 12582912,
+    "embed_lmhead": 622329856,
+    "total": 30531911680,
+    "active_per_token": 3041656832
+  },
+  "dram_headline": {
+    "experts_GiB_bf16": 54.0,
+    "experts_GiB_fp8": 27.0,
+    "experts_GiB_int4_awq_g32": 15.609,
+    "total_weights_GiB_int4_awq_g32": 17.263,
+    "experts_pct_of_bytes_int4": 90.42
+  },
+  "saturation": [
+    {
+      "B": 1,
+      "analytic_uniform_distinct_per_layer": 8.0,
+      "sim_skewed_mean_distinct": 8.0,
+      "sim_skewed_median_distinct": 8.0,
+      "sim_skewed_p5_distinct": 8.0,
+      "sim_skewed_p95_distinct": 8.0,
+      "frac_of_all_experts_uniform": 0.0625,
+      "frac_of_all_experts_skewed": 0.0625
+    },
+    {
+      "B": 2,
+      "analytic_uniform_distinct_per_layer": 15.5,
+      "sim_skewed_mean_distinct": 15.401,
+      "sim_skewed_median_distinct": 15.395,
+      "sim_skewed_p5_distinct": 15.329,
+      "sim_skewed_p95_distinct": 15.469,
+      "frac_of_all_experts_uniform": 0.1211,
+      "frac_of_all_experts_skewed": 0.1203
+    },
+    {
+      "B": 4,
+      "analytic_uniform_distinct_per_layer": 29.123,
+      "sim_skewed_mean_distinct": 28.639,
+      "sim_skewed_median_distinct": 28.648,
+      "sim_skewed_p5_distinct": 28.408,
+      "sim_skewed_p95_distinct": 28.845,
+      "frac_of_all_experts_uniform": 0.2275,
+      "frac_of_all_experts_skewed": 0.2237
+    },
+    {
+      "B": 8,
+      "analytic_uniform_distinct_per_layer": 51.62,
+      "sim_skewed_mean_distinct": 49.961,
+      "sim_skewed_median_distinct": 49.984,
+      "sim_skewed_p5_distinct": 49.455,
+      "sim_skewed_p95_distinct": 50.385,
+      "frac_of_all_experts_uniform": 0.4033,
+      "frac_of_all_experts_skewed": 0.3903
+    },
+    {
+      "B": 16,
+      "analytic_uniform_distinct_per_layer": 82.423,
+      "sim_skewed_mean_distinct": 78.196,
+      "sim_skewed_median_distinct": 78.277,
+      "sim_skewed_p5_distinct": 77.45,
+      "sim_skewed_p95_distinct": 78.942,
+      "frac_of_all_experts_uniform": 0.6439,
+      "frac_of_all_experts_skewed": 0.6109
+    },
+    {
+      "B": 32,
+      "analytic_uniform_distinct_per_layer": 111.771,
+      "sim_skewed_mean_distinct": 105.526,
+      "sim_skewed_median_distinct": 105.559,
+      "sim_skewed_p5_distinct": 104.304,
+      "sim_skewed_p95_distinct": 106.643,
+      "frac_of_all_experts_uniform": 0.8732,
+      "frac_of_all_experts_skewed": 0.8244
+    },
+    {
+      "B": 64,
+      "analytic_uniform_distinct_per_layer": 125.942,
+      "sim_skewed_mean_distinct": 121.771,
+      "sim_skewed_median_distinct": 121.84,
+      "sim_skewed_p5_distinct": 120.837,
+      "sim_skewed_p95_distinct": 122.807,
+      "frac_of_all_experts_uniform": 0.9839,
+      "frac_of_all_experts_skewed": 0.9513
+    },
+    {
+      "B": 128,
+      "analytic_uniform_distinct_per_layer": 127.967,
+      "sim_skewed_mean_distinct": 127.031,
+      "sim_skewed_median_distinct": 127.064,
+      "sim_skewed_p5_distinct": 126.567,
+      "sim_skewed_p95_distinct": 127.359,
+      "frac_of_all_experts_uniform": 0.9997,
+      "frac_of_all_experts_skewed": 0.9924
+    }
+  ],
+  "batch_sweep": [
+    {
+      "B": 1,
+      "distinct_per_layer_mean": 8.0,
+      "working_set_expert_bytes": 1047527424,
+      "working_set_expert_GiB": 0.976,
+      "resident_expert_GiB_int4": 15.609,
+      "weight_bytes_per_step": 2200895488,
+      "weight_GiB_per_step": 2.05,
+      "eff_BW_GBps": 523.8,
+      "MBU": 0.2923,
+      "step_time_ms": 4.202,
+      "modeled_throughput_tok_s": 238.0,
+      "modeled_per_seq_tok_s": 238.0
+    },
+    {
+      "B": 2,
+      "distinct_per_layer_mean": 15.401,
+      "working_set_expert_bytes": 2016605376,
+      "working_set_expert_GiB": 1.878,
+      "resident_expert_GiB_int4": 15.609,
+      "weight_bytes_per_step": 3169973440,
+      "weight_GiB_per_step": 2.952,
+      "eff_BW_GBps": 696.5,
+      "MBU": 0.3886,
+      "step_time_ms": 4.552,
+      "modeled_throughput_tok_s": 439.4,
+      "modeled_per_seq_tok_s": 219.71
+    },
+    {
+      "B": 4,
+      "distinct_per_layer_mean": 28.639,
+      "working_set_expert_bytes": 3750027552,
+      "working_set_expert_GiB": 3.492,
+      "resident_expert_GiB_int4": 15.609,
+      "weight_bytes_per_step": 4903395616,
+      "weight_GiB_per_step": 4.567,
+      "eff_BW_GBps": 869.1,
+      "MBU": 0.485,
+      "step_time_ms": 5.642,
+      "modeled_throughput_tok_s": 709.0,
+      "modeled_per_seq_tok_s": 177.25
+    },
+    {
+      "B": 8,
+      "distinct_per_layer_mean": 49.961,
+      "working_set_expert_bytes": 6541942176,
+      "working_set_expert_GiB": 6.093,
+      "resident_expert_GiB_int4": 15.609,
+      "weight_bytes_per_step": 7695310240,
+      "weight_GiB_per_step": 7.167,
+      "eff_BW_GBps": 1041.8,
+      "MBU": 0.5813,
+      "step_time_ms": 7.387,
+      "modeled_throughput_tok_s": 1083.0,
+      "modeled_per_seq_tok_s": 135.38
+    },
+    {
+      "B": 16,
+      "distinct_per_layer_mean": 78.196,
+      "working_set_expert_bytes": 10239073344,
+      "working_set_expert_GiB": 9.536,
+      "resident_expert_GiB_int4": 15.609,
+      "weight_bytes_per_step": 11392441408,
+      "weight_GiB_per_step": 10.61,
+      "eff_BW_GBps": 1214.4,
+      "MBU": 0.6777,
+      "step_time_ms": 9.381,
+      "modeled_throughput_tok_s": 1705.6,
+      "modeled_per_seq_tok_s": 106.6
+    },
+    {
+      "B": 32,
+      "distinct_per_layer_mean": 105.526,
+      "working_set_expert_bytes": 13817720448,
+      "working_set_expert_GiB": 12.869,
+      "resident_expert_GiB_int4": 15.609,
+      "weight_bytes_per_step": 14971088512,
+      "weight_GiB_per_step": 13.943,
+      "eff_BW_GBps": 1387.0,
+      "MBU": 0.774,
+      "step_time_ms": 10.794,
+      "modeled_throughput_tok_s": 2964.7,
+      "modeled_per_seq_tok_s": 92.65
+    },
+    {
+      "B": 64,
+      "distinct_per_layer_mean": 121.771,
+      "working_set_expert_bytes": 15944764608,
+      "working_set_expert_GiB": 14.85,
+      "resident_expert_GiB_int4": 15.609,
+      "weight_bytes_per_step": 17098132672,
+      "weight_GiB_per_step": 15.924,
+      "eff_BW_GBps": 1559.7,
+      "MBU": 0.8704,
+      "step_time_ms": 10.963,
+      "modeled_throughput_tok_s": 5838.1,
+      "modeled_per_seq_tok_s": 91.22
+    },
+    {
+      "B": 128,
+      "distinct_per_layer_mean": 127.031,
+      "working_set_expert_bytes": 16633589760,
+      "working_set_expert_GiB": 15.491,
+      "resident_expert_GiB_int4": 15.609,
+      "weight_bytes_per_step": 17786957824,
+      "weight_GiB_per_step": 16.565,
+      "eff_BW_GBps": 1732.3,
+      "MBU": 0.9667,
+      "step_time_ms": 10.268,
+      "modeled_throughput_tok_s": 12466.4,
+      "modeled_per_seq_tok_s": 97.39
+    }
+  ],
+  "real_anchors": [
+    {
+      "B": 1,
+      "regime": "burst no-batching",
+      "ttft_p50_ms": 4359,
+      "agg_tok_s": 238,
+      "src": "results/burst_none.json"
+    },
+    {
+      "B": 8,
+      "regime": "burst static (NPU-style)",
+      "ttft_p50_ms": 904,
+      "agg_tok_s": 863,
+      "src": "results/burst_static.json"
+    },
+    {
+      "B": 8,
+      "regime": "burst continuous",
+      "ttft_p50_ms": 641,
+      "agg_tok_s": 1083,
+      "src": "results/burst_continuous.json"
+    }
+  ],
+  "simulation": {
+    "alpha": 5.0,
+    "n_steps": 256,
+    "median_max_to_mean_load": 2.500037725996253,
+    "p95_max_to_mean_load": 3.190306866843847
+  },
+  "notes": [
+    "DRAM accounting is exact given the architecture (Qwen3-MoE Thinker).",
+    "Expert activation is a *model* (Dirichlet popularity + Gumbel top-k). Replace with measured routing via instrument_vllm_experts.py on a real GPU.",
+    "Throughput/TTFT are a roofline calibrated to repo's real 5090 anchors (B=1: 238 tok/s; B=8: 1083 tok/s aggregate). Treat as illustrative."
+  ]
+}

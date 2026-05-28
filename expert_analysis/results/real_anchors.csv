@@ -1,0 +1,4 @@
+B,regime,ttft_p50_ms,agg_tok_s,src
+1,burst no-batching,4359,238,results/burst_none.json
+8,burst static (NPU-style),904,863,results/burst_static.json
+8,burst continuous,641,1083,results/burst_continuous.json
