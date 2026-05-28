@@ -40,9 +40,14 @@ import os
 import random
 import statistics
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, field, asdict
 
 from openai import AsyncOpenAI
+
+# Multimodal / agent extensions (in-place — text-only baseline still works).
+import assets_loader
+import scenarios as _scenarios
+from agent_loop import run_agent_task, INTERACTIVE_SYSTEM_AGENT
 
 # ----------------------------------------------------------------------------- scenes
 
@@ -88,13 +93,21 @@ INTERACTIVE_QUERIES = [
 @dataclass
 class Req:
     rid: str
-    brain: str            # "proactive" | "interactive"
+    brain: str            # "proactive" | "interactive" | "agent"
     idx: int
     gidx: int             # global arrival index (for deterministic per-request seed)
     sys_prompt: str
-    user_prompt: str
+    user_prompt: object   # str (legacy) OR list[dict] (multimodal content blocks)
     max_tokens: int
     temperature: float
+    # ---- multimodal / agent extensions (defaults preserve backward compat) ----
+    brain_subtype: str = ""        # e.g. "proactive_audio", "agent_step0", "agent_step1"
+    parent_rid: str = ""           # for agent follow-up steps, the parent task id
+    step_idx: int = 0              # 0 = first request of the task; >0 = follow-up
+    n_audio_sec: float = 0.0       # duration of audio attached to this request
+    n_image: int = 0               # how many images attached
+    full_messages: list = None     # if set, overrides sys_prompt+user_prompt above
+    # ---- timestamps & accounting ----
     t_submit: float = 0.0       # entered the client queue (= "arrived")
     t_admitted: float = 0.0     # left the queue, request actually started
     t_first_token: float = 0.0
@@ -125,13 +138,19 @@ class Req:
 async def run_request(client, model, req: Req, t0: float, seed: int, log):
     req.t_admitted = time.monotonic()
     wq = req.queue_wait * 1000
-    log(f"[t={req.t_admitted - t0:6.2f}s] {req.brain:<11s} #{req.idx:<2d} admitted   "
+    label = f"{req.brain:<11s} #{req.idx:<2d}"
+    if req.parent_rid:
+        label += f" [parent={req.parent_rid} step={req.step_idx}]"
+    log(f"[t={req.t_admitted - t0:6.2f}s] {label} admitted   "
         f"(waited {wq:6.0f} ms in client queue" + (f", wave #{req.wave_id}" if req.wave_id >= 0 else "") + ")")
     try:
+        messages = req.full_messages or [
+            {"role": "system", "content": req.sys_prompt},
+            {"role": "user",   "content": req.user_prompt},
+        ]
         stream = await client.chat.completions.create(
             model=model,
-            messages=[{"role": "system", "content": req.sys_prompt},
-                      {"role": "user", "content": req.user_prompt}],
+            messages=messages,
             max_tokens=req.max_tokens,
             temperature=req.temperature,
             seed=seed,
@@ -144,7 +163,7 @@ async def run_request(client, model, req: Req, t0: float, seed: int, log):
                 if getattr(delta, "content", None):
                     if not req.t_first_token:
                         req.t_first_token = time.monotonic()
-                        log(f"[t={req.t_first_token - t0:6.2f}s] {req.brain:<11s} #{req.idx:<2d} first token "
+                        log(f"[t={req.t_first_token - t0:6.2f}s] {label} first token "
                             f"(TTFT {req.ttft*1000:6.0f} ms = {req.queue_wait*1000:.0f} queue + "
                             f"{(req.t_first_token-req.t_admitted)*1000:.0f} prefill)")
                     req.content += delta.content
@@ -153,13 +172,13 @@ async def run_request(client, model, req: Req, t0: float, seed: int, log):
         req.t_finish = time.monotonic()
         if not req.n_out_tokens:
             req.n_out_tokens = max(1, len(req.content) // 2)
-        log(f"[t={req.t_finish - t0:6.2f}s] {req.brain:<11s} #{req.idx:<2d} DONE  "
+        log(f"[t={req.t_finish - t0:6.2f}s] {label} DONE  "
             f"({req.n_out_tokens:3d} tok, e2e {req.e2e:5.2f}s, decode {req.decode_tps:5.1f} tok/s)  "
             f"-> {req.content[:42].replace(chr(10),' ')!r}")
     except Exception as e:  # noqa: BLE001
         req.t_finish = time.monotonic()
         req.error = repr(e)
-        log(f"[t={req.t_finish - t0:6.2f}s] {req.brain:<11s} #{req.idx:<2d} ERROR {e!r}")
+        log(f"[t={req.t_finish - t0:6.2f}s] {label} ERROR {e!r}")
 
 
 # --------------------------------------------------------------------- admission controller
@@ -181,15 +200,29 @@ class Dispatcher:
         self.kick = asyncio.Event()
         self.arrivals_done = False
         self.wave_counter = 0
+        # Per-request completion events — used by agent_loop to await one step
+        # before launching the next. Keyed by req.rid.
+        self.done_events: dict[str, asyncio.Event] = {}
 
     def submit(self, req: Req):
         """Called by the arrival generators when a request 'arrives'."""
         req.t_submit = time.monotonic()
         self.reqs.append(req)
         self.pending.append(req)
-        self.log(f"[t={req.t_submit - self.t0:6.2f}s] {req.brain:<11s} #{req.idx:<2d} arrived    "
+        if req.rid not in self.done_events:
+            self.done_events[req.rid] = asyncio.Event()
+        label = f"{req.brain:<11s} #{req.idx:<2d}"
+        if req.parent_rid:
+            label += f" [parent={req.parent_rid} step={req.step_idx}]"
+        self.log(f"[t={req.t_submit - self.t0:6.2f}s] {label} arrived    "
                  f"(pending {len(self.pending)}, in-flight {len(self.in_flight)})")
         self.kick.set()
+
+    async def submit_and_await(self, req: Req) -> Req:
+        """Submit a request and wait for its completion (used by agent_loop)."""
+        self.submit(req)
+        await self.done_events[req.rid].wait()
+        return req
 
     def mark_arrivals_done(self):
         self.arrivals_done = True
@@ -200,11 +233,14 @@ class Dispatcher:
         req.wave_id = wave_id
         seed = self.args.seed * 100003 + req.gidx
         task = asyncio.create_task(run_request(self.client, self.args.model, req, self.t0, seed, self.log))
-        task.add_done_callback(self._on_done)
+        task.add_done_callback(lambda t, r=req: self._on_done(t, r))
         self.in_flight.add(task)
 
-    def _on_done(self, task):
+    def _on_done(self, task, req: Req):
         self.in_flight.discard(task)
+        ev = self.done_events.get(req.rid)
+        if ev is not None:
+            ev.set()
         self.kick.set()
 
     def _maybe_admit(self):
@@ -239,14 +275,36 @@ class Dispatcher:
 
 # ------------------------------------------------------------------------- arrival generators
 
+PROACTIVE_SYSTEM_AUDIO = (
+    "你是車艙智慧助手的『主動偵測』模組。每次收到：一張艙內外合成影像、一段艙內現場語音描述、"
+    "一段車輛狀態 JSON。請依序輸出："
+    "(1)【觀察】兩三句描述你看到/聽到的重點；"
+    "(2)【動作】一行 JSON：{\"action\":\"<名稱>\",\"args\":{...}}（adjust_temperature / close_window / "
+    "open_vent / play_music / suggest_rest / none 等）；"
+    "(3)【理由】兩三句說明為什麼這樣判斷；"
+    "(4)【後續】一句話提醒駕駛接下來要留意什麼。請完整寫完四部分。"
+)
+
+
 async def proactive_arrivals(disp: Dispatcher, args, t0):
+    """Periodic proactive ticks. Multimodal when --use-audio (default for scenarios)."""
     i = 0
     await asyncio.sleep(0.5)
     while time.monotonic() - t0 < args.duration:
-        scene = PROACTIVE_SCENES[i % len(PROACTIVE_SCENES)]
-        disp.submit(Req(rid=f"P{i}", brain="proactive", idx=i, gidx=_next_gidx(),
-                        sys_prompt=PROACTIVE_SYSTEM, user_prompt=PROACTIVE_PROMPT_PREFIX + scene,
-                        max_tokens=args.proactive_max_tokens, temperature=0.3))
+        if args.use_audio:
+            scene_idx = i % 8                                      # 8 WAV/JPG/vehicle rows
+            blocks = assets_loader.proactive_content_blocks(scene_idx)
+            audio_sec = assets_loader.audio_duration_for_proactive(scene_idx)
+            disp.submit(Req(rid=f"P{i}", brain="proactive", idx=i, gidx=_next_gidx(),
+                            sys_prompt=PROACTIVE_SYSTEM_AUDIO, user_prompt=blocks,
+                            brain_subtype="proactive_audio",
+                            n_audio_sec=audio_sec, n_image=1,
+                            max_tokens=args.proactive_max_tokens, temperature=0.3))
+        else:
+            scene = PROACTIVE_SCENES[i % len(PROACTIVE_SCENES)]
+            disp.submit(Req(rid=f"P{i}", brain="proactive", idx=i, gidx=_next_gidx(),
+                            sys_prompt=PROACTIVE_SYSTEM, user_prompt=PROACTIVE_PROMPT_PREFIX + scene,
+                            max_tokens=args.proactive_max_tokens, temperature=0.3))
         i += 1
         await asyncio.sleep(args.proactive_interval)
 
@@ -268,6 +326,69 @@ async def interactive_arrivals(disp: Dispatcher, args, t0):
                         sys_prompt=INTERACTIVE_SYSTEM, user_prompt=q,
                         max_tokens=args.interactive_max_tokens, temperature=0.6))
         i += 1
+
+
+async def agent_arrivals(disp: Dispatcher, args, t0, agent_launches):
+    """Launch each agent task at its scheduled start_time_s.
+
+    Each launched task is a tool-loop driven by agent_loop.run_agent_task, which
+    submits N follow-up Reqs through disp.submit_and_await. Spawning is concurrent
+    (an asyncio.Task per agent), so multiple tasks can be in different steps at
+    the same wall-clock — exactly what continuous batching needs to demonstrate
+    its advantage.
+    """
+    coros = []
+
+    async def launch(start_s: float, task_idx: int):
+        now = time.monotonic() - t0
+        if start_s > now:
+            await asyncio.sleep(start_s - now)
+        task_global_id = f"A{task_idx}"
+        i_ref = [_next_agent_step_counter()]   # mutable, captured by submit_step
+
+        async def submit_step(*, step_idx, parent_rid, messages, max_tokens,
+                              temperature, gidx, audio_seconds):
+            rid = f"{task_global_id}_s{step_idx}"
+            # audio_seconds=None means "step 0, look it up"; else "no audio re-sent"
+            audio_sec = (assets_loader.audio_duration_for_interactive(task_idx)
+                         if audio_seconds is None else float(audio_seconds))
+            n_img = 0
+            req = Req(rid=rid, brain="agent", idx=i_ref[0],
+                      gidx=gidx,
+                      sys_prompt="", user_prompt="",   # ignored because full_messages set
+                      brain_subtype=f"agent_step{step_idx}",
+                      parent_rid=parent_rid, step_idx=step_idx,
+                      n_audio_sec=audio_sec, n_image=n_img,
+                      full_messages=messages,
+                      max_tokens=max_tokens, temperature=temperature)
+            i_ref[0] = _next_agent_step_counter()
+            return await disp.submit_and_await(req)
+
+        def step0_blocks():
+            return assets_loader.interactive_content_blocks_step0(task_idx)
+
+        await run_agent_task(
+            submit_step=submit_step,
+            task_idx=task_idx,
+            task_global_id=task_global_id,
+            audio_blocks_step0=step0_blocks,
+            next_gidx=_next_gidx,
+            log=disp.log,
+        )
+
+    for launch_spec in agent_launches:
+        coros.append(launch(launch_spec.start_time_s, launch_spec.task_idx))
+    if coros:
+        await asyncio.gather(*coros)
+
+
+# Counter for the per-task idx field; survives across all agent tasks so each
+# Req gets a unique idx within the brain="agent" stream.
+_AGENT_STEP_COUNTER = [0]
+def _next_agent_step_counter() -> int:
+    v = _AGENT_STEP_COUNTER[0]
+    _AGENT_STEP_COUNTER[0] += 1
+    return v
 
 
 async def burst_arrivals(disp: Dispatcher, args, t0):
@@ -302,18 +423,27 @@ def pct(xs, p):
 def summarize(reqs, wall, args):
     inter = [r for r in reqs if r.brain == "interactive" and not r.error]
     pro = [r for r in reqs if r.brain == "proactive" and not r.error]
+    agent_all = [r for r in reqs if r.brain == "agent" and not r.error]
+    agent_step0 = [r for r in agent_all if r.step_idx == 0]
+    agent_followup = [r for r in agent_all if r.step_idx > 0]
     ok = [r for r in reqs if not r.error and r.t_finish]
     total_out = sum(r.n_out_tokens for r in reqs if not r.error)
     busy = (max(r.t_finish for r in ok) - min(r.t_submit for r in ok)) if ok else float("nan")
     n_waves = (max((r.wave_id for r in reqs if r.wave_id >= 0), default=-1) + 1)
+    n_agent_tasks = len({r.parent_rid for r in agent_all if r.parent_rid})
+    audio_secs = [r.n_audio_sec for r in reqs if r.n_audio_sec > 0]
     return {
         "mode": args.mode, "batch_size": (1 if args.mode == "none" else args.batch_size),
         "config": args.config, "server_max_num_seqs": args.max_num_seqs,
+        "scenario": getattr(args, "scenario", None),
         "wall_clock_s": round(wall, 3),
         "busy_span_s": round(busy, 3),
         "busy_output_tok_per_s": round(total_out / busy, 1) if busy and busy > 0 else 0.0,
         "n_requests_total": len(reqs), "n_errors": sum(1 for r in reqs if r.error),
-        "n_interactive": len(inter), "n_proactive": len(pro), "n_waves": n_waves,
+        "n_interactive": len(inter), "n_proactive": len(pro),
+        "n_agent_requests": len(agent_all), "n_agent_tasks": n_agent_tasks,
+        "n_agent_step0": len(agent_step0), "n_agent_followup": len(agent_followup),
+        "n_waves": n_waves,
         "interactive_ttft_p50_s": round(pct([r.ttft for r in inter], 50), 3),
         "interactive_ttft_p95_s": round(pct([r.ttft for r in inter], 95), 3),
         "interactive_ttft_max_s": round(max([r.ttft for r in inter], default=float("nan")), 3),
@@ -323,6 +453,12 @@ def summarize(reqs, wall, args):
         "proactive_ttft_p50_s": round(pct([r.ttft for r in pro], 50), 3),
         "proactive_e2e_p50_s": round(pct([r.e2e for r in pro], 50), 3),
         "proactive_e2e_max_s": round(max([r.e2e for r in pro], default=float("nan")), 3),
+        "agent_ttft_p50_s": round(pct([r.ttft for r in agent_all], 50), 3),
+        "agent_ttft_p95_s": round(pct([r.ttft for r in agent_all], 95), 3),
+        "agent_step0_ttft_p50_s": round(pct([r.ttft for r in agent_step0], 50), 3),
+        "agent_followup_ttft_p50_s": round(pct([r.ttft for r in agent_followup], 50), 3),
+        "agent_e2e_p50_s": round(pct([r.e2e for r in agent_all], 50), 3),
+        "mean_audio_seconds": round(statistics.fmean(audio_secs), 2) if audio_secs else 0.0,
         "total_output_tokens": total_out,
         "mean_decode_tok_per_s": round(statistics.fmean(
             [r.decode_tps for r in reqs if not r.error and r.decode_tps == r.decode_tps]), 1)
@@ -333,14 +469,21 @@ def summarize(reqs, wall, args):
 def print_table(s):
     print("\n" + "=" * 80)
     print(f" SUMMARY  mode={s['mode']!r}  batch_size={s['batch_size']}  "
-          f"server_max_num_seqs={s['server_max_num_seqs']}")
+          f"server_max_num_seqs={s['server_max_num_seqs']}  "
+          f"scenario={s.get('scenario')!r}")
     print("=" * 80)
     rows = [
-        ("requests done (interactive / proactive)", f"{s['n_interactive']} / {s['n_proactive']}  (errors {s['n_errors']}, waves {s['n_waves']})"),
+        ("counts (interactive / proactive / agent reqs · tasks)",
+         f"{s['n_interactive']} / {s['n_proactive']} / "
+         f"{s.get('n_agent_requests', 0)} · {s.get('n_agent_tasks', 0)}  "
+         f"(errors {s['n_errors']}, waves {s['n_waves']})"),
         ("interactive TTFT  p50 / p95 / max  (s)", f"{s['interactive_ttft_p50_s']} / {s['interactive_ttft_p95_s']} / {s['interactive_ttft_max_s']}"),
         ("interactive  e2e  p50 / p95        (s)", f"{s['interactive_e2e_p50_s']} / {s['interactive_e2e_p95_s']}"),
         ("interactive queue-wait p50          (s)", f"{s['interactive_queue_wait_p50_s']}"),
         ("proactive  TTFT p50 / e2e p50 / e2e max (s)", f"{s['proactive_ttft_p50_s']} / {s['proactive_e2e_p50_s']} / {s['proactive_e2e_max_s']}"),
+        ("agent     TTFT p50 / p95 / e2e p50 (s)", f"{s.get('agent_ttft_p50_s')} / {s.get('agent_ttft_p95_s')} / {s.get('agent_e2e_p50_s')}"),
+        ("agent step0 TTFT p50 / followup TTFT p50 (s)", f"{s.get('agent_step0_ttft_p50_s')} / {s.get('agent_followup_ttft_p50_s')}"),
+        ("mean audio seconds per request", s.get("mean_audio_seconds", 0.0)),
         ("total output tokens", s["total_output_tokens"]),
         ("busy span (first submit -> last finish) (s)", s["busy_span_s"]),
         ("output throughput over busy span (tok/s)", s["busy_output_tok_per_s"]),
@@ -374,11 +517,36 @@ async def main():
                     help="if >0: saturated mode -- this many interactive requests arrive at once; no proactive")
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--out", default=None)
+    # --- multimodal / agent extensions ---
+    ap.add_argument("--scenario", default=None,
+                    choices=list(_scenarios.SCENARIOS.keys()),
+                    help="named scenario (overrides --burst / --duration / agent schedule). "
+                         "Pick one of: pure_proactive / pure_agent / mixed_1agent / mixed_3agent / burst24.")
+    ap.add_argument("--use-audio", dest="use_audio", action="store_true", default=None,
+                    help="Send audio+image+vehicle JSON for proactive ticks (default: on when --scenario "
+                         "is set, off otherwise).")
+    ap.add_argument("--no-use-audio", dest="use_audio", action="store_false",
+                    help="Force text-only proactive prompts (backward compat with the original benchmark).")
     args = ap.parse_args()
     if args.config is None:
         args.config = args.mode
     if args.out is None:
         args.out = f"results/run_{args.config}.json"
+    if args.scenario:
+        spec = _scenarios.get(args.scenario)
+        args.duration = spec.duration_s
+        args.proactive_interval = spec.proactive_interval_s
+        args.proactive_max_tokens = spec.proactive_max_tokens
+        if spec.burst_n > 0:
+            args.burst = spec.burst_n
+            args.interactive_max_tokens = spec.burst_max_tokens
+        # default-on audio when running a scenario
+        if args.use_audio is None:
+            args.use_audio = True
+    else:
+        spec = None
+        if args.use_audio is None:
+            args.use_audio = False
 
     client = AsyncOpenAI(base_url=f"http://{args.host}:{args.port}/v1", api_key="EMPTY", timeout=180.0)
 
@@ -399,11 +567,24 @@ async def main():
         log_lines.append(line)
 
     _GIDX[0] = 0
+    _AGENT_STEP_COUNTER[0] = 0
     t0 = time.monotonic()
     disp = Dispatcher(client, args, t0, log)
 
     async def arrivals():
-        if args.burst > 0:
+        if spec is not None:
+            # Scenario-driven arrivals (multimodal + agent tool-loop)
+            sub = []
+            if spec.burst_n > 0:
+                sub.append(burst_arrivals(disp, args, t0))
+            else:
+                if spec.proactive_enabled:
+                    sub.append(proactive_arrivals(disp, args, t0))
+                if spec.agent_launches:
+                    sub.append(agent_arrivals(disp, args, t0, spec.agent_launches))
+            if sub:
+                await asyncio.gather(*sub)
+        elif args.burst > 0:
             await burst_arrivals(disp, args, t0)
         else:
             await asyncio.gather(proactive_arrivals(disp, args, t0),
@@ -416,7 +597,7 @@ async def main():
     out_reqs = []
     for r in disp.reqs:
         d = asdict(r)
-        for k in ("sys_prompt", "user_prompt"):
+        for k in ("sys_prompt", "user_prompt", "full_messages"):
             d.pop(k, None)
         for k in ("t_submit", "t_admitted", "t_first_token", "t_finish"):
             d[k] = round(d[k] - t0, 4) if d[k] else 0.0

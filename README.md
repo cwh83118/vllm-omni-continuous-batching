@@ -5,6 +5,11 @@
 「交互對話」兩個應用共用同一顆模型的情境。
 
 > 📄 **完整圖文報告（背景 → 三種排程方式 → 實驗方法 → 結果與三 panel 時間軸圖 → 體驗解釋 → 為什麼是這些數字 → cross-check）：[`REPORT.md`](REPORT.md)**
+>
+> 🚗 **進階版（多模態 + 多步代理 + batch size 1/2/4/8/16 sweep + in-flight 並發帶視覺化 + CX1 啟發）：[`REPORT_DUAL.md`](REPORT_DUAL.md)**
+> 在原版（純文字、固定 B=8）的基礎上把輸入換成 **真實 audio + image + 車輛 JSON**、interactive 升級成 **多步 tool-loop agent**、
+> 跑了 **55 個 sweep run**（5 情境 × 3 mode × B {1,2,4,8,16}），並在每張 timeline 下方加了 **in-flight count over time** 條，
+> 讓「哪些 request 同時在 GPU 上被一起 decode」一眼看得出來。
 
 ---
 

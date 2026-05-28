@@ -19,12 +19,14 @@ import sys
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
 from matplotlib.patches import Patch
 from matplotlib.lines import Line2D
 
 COL = {
-    "proactive":   {"wait": "#f3c9b6", "gen": "#e8743b"},   # orange
-    "interactive": {"wait": "#bcd4e6", "gen": "#2a6f97"},   # blue
+    "proactive":   {"wait": "#f3c9b6", "gen": "#e8743b"},   # orange — periodic background
+    "interactive": {"wait": "#bcd4e6", "gen": "#2a6f97"},   # blue   — single-turn (burst scenario)
+    "agent":       {"wait": "#bce6dc", "gen": "#2a9d8f"},   # teal   — multi-turn tool-loop
 }
 MODE_TITLE = {
     "none":       "(1) NO batching  — max 1 in flight (≡ max_num_seqs=1)",
@@ -47,6 +49,60 @@ def panel_label(d):
     return base
 
 
+def compute_concurrency(reqs):
+    """Return (xs, ys): step function of in-flight (admitted but not finished) request count."""
+    events = []
+    for r in reqs:
+        adm = r.get("t_admitted") or 0.0
+        fin = r.get("t_finish") or 0.0
+        if not fin:
+            continue
+        events.append((adm, +1))
+        events.append((fin, -1))
+    if not events:
+        return [0.0], [0]
+    events.sort()
+    xs = [0.0]
+    ys = [0]
+    cur = 0
+    for t, d in events:
+        xs.append(t)
+        ys.append(cur)   # step BEFORE event
+        cur += d
+        xs.append(t)
+        ys.append(cur)   # step AFTER event
+    return xs, ys
+
+
+def draw_concurrency_strip(ax, data, xmax, mode_color):
+    """Draw an in-flight-count step plot below the timeline. Makes 'which requests
+    are batched together at a given instant' explicit — the higher the line, the
+    more requests are simultaneously decoding on the GPU."""
+    reqs = data["requests"]
+    xs, ys = compute_concurrency(reqs)
+    ax.fill_between(xs, 0, ys, step="post", alpha=0.25, color=mode_color, linewidth=0)
+    ax.step(xs, ys, where="post", color=mode_color, linewidth=1.2)
+    ax.set_xlim(0, xmax * 1.12)
+    ymax = max(ys) if ys else 1
+    ax.set_ylim(-0.3, max(ymax + 0.7, 2))
+    ax.set_ylabel("in-flight", fontsize=7, color="#555")
+    ax.tick_params(axis="y", labelsize=7, colors="#555")
+    ax.tick_params(axis="x", labelsize=8)
+    ax.set_xlabel("wall-clock time (s)", fontsize=9)
+    ax.grid(axis="x", alpha=0.15)
+    ax.set_yticks([0, ymax] if ymax >= 1 else [0, 1])
+    # annotate the peak in the corner
+    ax.text(xmax * 0.99, ymax, f"peak={ymax}", ha="right", va="bottom",
+            fontsize=7, color=mode_color, fontweight="bold")
+
+
+MODE_STRIP_COLOR = {
+    "none":       "#b71c1c",
+    "static":     "#ef6c00",
+    "continuous": "#2e7d32",
+}
+
+
 def draw_panel(ax, data, title, shared_xmax=None):
     reqs = sorted(data["requests"], key=lambda r: (r["t_submit"], r["brain"], r["idx"]))
     xmax = shared_xmax or max((r["t_finish"] for r in reqs if r["t_finish"]), default=1.0)
@@ -64,27 +120,49 @@ def draw_panel(ax, data, title, shared_xmax=None):
             ax.axvline(t, color="#888", lw=0.8, ls=":", zorder=1)
             ax.text(t, len(reqs) - 0.2, f"w{w}", fontsize=6, color="#888", ha="left", va="bottom")
 
+    # Build row index lookup so agent follow-up steps can draw a sibling connector
+    # arrow back to their previous step's finish point.
+    row_of = {(r.get("brain"), r.get("idx")): len(reqs) - 1 - row for row, r in enumerate(reqs)}
+    # And, by parent_rid+step_idx, an x-coord lookup for the previous sibling step.
+    last_finish_of_task = {}  # parent_rid -> (y_of_last_step, t_finish_of_last_step)
+
     for row, r in enumerate(reqs):
         y = len(reqs) - 1 - row  # newest at bottom
         c = COL.get(r["brain"], COL["interactive"])
         t_s, t_ft, t_f = r["t_submit"], r.get("t_first_token") or 0.0, r["t_finish"]
         if not t_f:
             continue
+        # Hatch agent follow-up steps so the eye can distinguish step 0 (with audio)
+        # from text-only follow-ups.
+        is_agent_followup = (r.get("brain") == "agent" and (r.get("step_idx") or 0) > 0)
+        hatch = "//" if is_agent_followup else None
         if t_ft and t_ft > t_s:
             ax.barh(y, t_ft - t_s, left=t_s, height=0.8, color=c["wait"], edgecolor="none", zorder=2)
         gen_start = t_ft if t_ft else t_s
-        ax.barh(y, max(t_f - gen_start, 0.01), left=gen_start, height=0.8, color=c["gen"], edgecolor="none", zorder=3)
+        ax.barh(y, max(t_f - gen_start, 0.01), left=gen_start, height=0.8,
+                color=c["gen"], edgecolor=("white" if hatch else "none"), hatch=hatch, linewidth=0.0,
+                zorder=3)
         if t_ft:
             ax.plot([t_ft], [y], marker="|", ms=8, mew=1.4, color="#222", zorder=4)
-        if r["brain"] == "interactive" and r.get("ttft_s") is not None:
+        # Sibling connector arrow: from previous step's finish to this step's submit.
+        parent = r.get("parent_rid") or ""
+        if parent and parent in last_finish_of_task:
+            py, pt = last_finish_of_task[parent]
+            ax.annotate("", xy=(t_s, y), xytext=(pt, py),
+                        arrowprops=dict(arrowstyle="-", color="#aaaaaa", lw=0.6, alpha=0.7,
+                                        connectionstyle="arc3,rad=0.05"),
+                        zorder=2.5)
+        if parent:
+            last_finish_of_task[parent] = (y, t_f)
+        if r["brain"] in ("interactive", "agent") and r.get("ttft_s") is not None:
             ms = r["ttft_s"] * 1000
             txt = f"{ms:.0f} ms" if ms < 1000 else f"{ms/1000:.1f} s"
             ax.text(t_f + xmax * 0.006, y, txt, va="center", ha="left", fontsize=6, color="#444")
 
     ax.set_xlim(0, xmax * 1.12)
     ax.set_ylim(-0.7, len(reqs) - 0.3 + (1.0 if data.get("mode") == "static" else 0.0))
-    ax.set_xlabel("wall-clock time (s)")
     ax.set_yticks([])
+    ax.tick_params(axis="x", labelbottom=False)   # x-axis labels live on the strip below
     s = data["summary"]
     def fmt_ms(v):
         return f"{v*1000:.0f} ms" if v == v and v < 1.0 else (f"{v:.2f} s" if v == v else "—")
@@ -98,14 +176,17 @@ def draw_panel(ax, data, title, shared_xmax=None):
 
 def legend(fig):
     handles = [
-        Patch(facecolor=COL["interactive"]["gen"], label="interactive — generating tokens"),
-        Patch(facecolor=COL["interactive"]["wait"], label="interactive — queued / prefill (before 1st token = TTFT)"),
-        Patch(facecolor=COL["proactive"]["gen"], label="proactive — generating tokens"),
+        Patch(facecolor=COL["proactive"]["gen"], label="proactive — generating"),
         Patch(facecolor=COL["proactive"]["wait"], label="proactive — queued / prefill"),
-        Line2D([0], [0], marker="|", ms=10, mew=1.8, color="#222", ls="none", label="first token delivered to the user"),
+        Patch(facecolor=COL["agent"]["gen"], label="agent step 0 (with audio) — generating"),
+        Patch(facecolor=COL["agent"]["gen"], hatch="//", edgecolor="white", label="agent follow-up step (text-only) — generating"),
+        Patch(facecolor=COL["interactive"]["gen"], label="interactive (burst) — generating"),
+        Line2D([0], [0], marker="|", ms=10, mew=1.8, color="#222", ls="none", label="first token delivered to user"),
         Line2D([0], [0], color="#888", ls=":", lw=1.2, label="static-batch wave boundary"),
+        Line2D([0], [0], color="#aaaaaa", lw=0.6, label="agent task — sibling steps"),
+        Line2D([0], [0], color="#2e7d32", lw=1.5, label="strip below: in-flight request count (= batch concurrency over time)"),
     ]
-    fig.legend(handles=handles, loc="lower center", ncol=3, fontsize=8, frameon=False, bbox_to_anchor=(0.5, -0.02))
+    fig.legend(handles=handles, loc="lower center", ncol=3, fontsize=8, frameon=False, bbox_to_anchor=(0.5, 0.02))
 
 
 def print_table(datas):
@@ -163,15 +244,21 @@ def main():
 
     nrows = max(len(d["requests"]) for d in datas)
     npan = len(datas)
-    fig, axes = plt.subplots(1, npan, figsize=(6.4 * npan, max(4.5, 0.22 * nrows + 2.0)))
-    if npan == 1:
-        axes = [axes]
+    fig_h = max(5.0, 0.22 * nrows + 2.6)
+    fig = plt.figure(figsize=(6.4 * npan, fig_h))
+    # 2 rows × N panels: timeline on top (5x height), in-flight strip below (1x).
+    gs = GridSpec(2, npan, height_ratios=[5, 1], hspace=0.06,
+                  wspace=0.12, left=0.04, right=0.98, top=0.92, bottom=0.16)
     fig.suptitle(args.title, fontsize=12, y=0.995)
     xmax = max((r["t_finish"] for d in datas for r in d["requests"] if r["t_finish"]), default=1.0) if args.share_x else None
-    for ax, d in zip(axes, datas):
-        draw_panel(ax, d, panel_label(d), shared_xmax=xmax)
+    for col, d in enumerate(datas):
+        ax_top = fig.add_subplot(gs[0, col])
+        ax_bot = fig.add_subplot(gs[1, col], sharex=ax_top)
+        local_xmax = xmax or max((r["t_finish"] for r in d["requests"] if r["t_finish"]), default=1.0)
+        draw_panel(ax_top, d, panel_label(d), shared_xmax=local_xmax)
+        mode_c = MODE_STRIP_COLOR.get(d.get("mode"), "#444")
+        draw_concurrency_strip(ax_bot, d, local_xmax, mode_c)
     legend(fig)
-    fig.tight_layout(rect=[0, 0.06, 1, 0.96])
     fig.savefig(args.out, dpi=130, bbox_inches="tight")
     print(f"wrote {args.out}")
     print_table(datas)

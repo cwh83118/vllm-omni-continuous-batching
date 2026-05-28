@@ -1,0 +1,82 @@
+[
+  {
+    "scene_idx": 0,
+    "speed_kmh": 60,
+    "cabin_temp_c": 18,
+    "ac_fan": "high",
+    "ac_target_c": 24,
+    "window_rear_left": "ajar",
+    "fuel_pct": 65,
+    "destination": "台中"
+  },
+  {
+    "scene_idx": 1,
+    "speed_kmh": 80,
+    "cabin_temp_c": 23,
+    "ac_fan": "auto",
+    "ac_target_c": 23,
+    "window_rear_left": "closed",
+    "fuel_pct": 72,
+    "destination": "新竹"
+  },
+  {
+    "scene_idx": 2,
+    "speed_kmh": 110,
+    "cabin_temp_c": 22,
+    "ac_fan": "low",
+    "ac_target_c": 22,
+    "window_rear_left": "closed",
+    "fuel_pct": 48,
+    "destination": "高雄"
+  },
+  {
+    "scene_idx": 3,
+    "speed_kmh": 50,
+    "cabin_temp_c": 24,
+    "ac_fan": "auto",
+    "ac_target_c": 24,
+    "window_rear_left": "closed",
+    "fuel_pct": 60,
+    "destination": "市區"
+  },
+  {
+    "scene_idx": 4,
+    "speed_kmh": 30,
+    "cabin_temp_c": 19,
+    "ac_fan": "high",
+    "ac_target_c": 22,
+    "window_rear_left": "closed",
+    "fuel_pct": 78,
+    "destination": "公司"
+  },
+  {
+    "scene_idx": 5,
+    "speed_kmh": 55,
+    "cabin_temp_c": 23,
+    "ac_fan": "auto",
+    "ac_target_c": 23,
+    "window_rear_left": "closed",
+    "fuel_pct": 55,
+    "destination": "陽明山"
+  },
+  {
+    "scene_idx": 6,
+    "speed_kmh": 90,
+    "cabin_temp_c": 22,
+    "ac_fan": "low",
+    "ac_target_c": 22,
+    "window_rear_left": "closed",
+    "fuel_pct": 68,
+    "destination": "桃園"
+  },
+  {
+    "scene_idx": 7,
+    "speed_kmh": 40,
+    "cabin_temp_c": 27,
+    "ac_fan": "auto",
+    "ac_target_c": 23,
+    "window_rear_left": "closed",
+    "fuel_pct": 32,
+    "destination": "回家"
+  }
+]
