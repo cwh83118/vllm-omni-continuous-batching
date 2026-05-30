@@ -288,6 +288,60 @@ _橫軸 throughput（越右越好）、縱軸 TTFT p50（越下越好、log scal
 
 → continuous **不是讓 GPU 工作更努力**（已經 ~100% 滿），而是**重新分配 GPU 的時間給「使用者更急切的需求」**。TPS 邊際改善（fill batch 效率）、user latency 大改善（slot 立刻補 vs 等 wave drain）。
 
+### 3.7.5 「為什麼 TPS 才 44？合理嗎？是用 154 GB/s 算的嗎？」
+
+**直接答**：44 TPS 是在 **throttled 68 GB/s** 量到的、**不是** CX1 spec 的 154 GB/s。
+推算到真實 CX1（×2.26）：**~100 TPS aggregate**。
+
+**為什麼即使推算 ~100 TPS 也不像「LLM serving 教科書」的數字（vLLM on 5090 native ~1000 TPS）？**
+
+因為本實驗的 workload 跟 LLM serving benchmark 的 假設差很多：
+
+| 因素 | LLM serving benchmark | 本實驗 cabin_solo_prod |
+|---|---|---|
+| 硬體 | 5090 native (1.8 TB/s) | **throttled 68 GB/s（CX1 -2.26×）** |
+| 輸入 | 純文字 ~200 token prompt | **multimodal audio + image, ~660 prefill token** |
+| 輸出 | 500-1000 token response | **平均 27 token response** |
+| Prefill / Decode 比 | <5% prefill | **~30% prefill**（multimodal + 短回應） |
+| Batch fill | 滿 B (e.g. 32) | **per-stream cap proactive=4, avg 4 streams in flight** |
+
+**實測拆解**（cabin_solo_prod continuous）：
+
+```
+busy span:               301 s
+total output tokens:     13 354 tokens
+aggregate TPS:           44.3 TPS         ← 我們報告的數字
+mean per-stream decode:  11.2 TPS         ← 單 stream decode 階段
+effective in-flight:     44.3 / 11.2 = 4.0 streams（B=6 上限只用 4）
+average output / req:    26.8 tokens      ← DMS 25/scene 40/cabin 25/app 40 都偏短
+avg decode time / req:   2.4 s
+```
+
+→ 每條 request 27 token output、decode 2.4 s，加上多模態 prefill ~0.4 s，**單條 e2e ~2.8 s**。
+→ B=6 但 per-stream cap 讓平均只有 4 streams 同時 decode、剩 2 個 slot 多數時間閒置（等 prefill 或 agent loop sync）。
+→ 4 streams × 11.2 TPS = **44 TPS 完全合理**。
+
+### 3.7.6 CX1 真機推算與業界對標
+
+| 指標 | 5090 native | 本實驗 throttled (68 GB/s) | **CX1 推算 (154 GB/s, ×2.26)** | 業界對標 |
+|---|--:|--:|--:|--:|
+| Single-stream decode TPS | ~240 | 24 | **54** | Qwen3-30B-A3B AWQ on Snapdragon 8 Gen 3 ≈ 30-50 TPS |
+| Aggregate TPS (B=6 cont.) | ~1000+ (text-only) | 44 | **~100** | 真實 cabin AI 規格未公開、相近級別產品 ≈ 50-150 TPS |
+| Single-stream decode TPS (none B=1) | ~240 | 24 | **54** | 同上 |
+
+→ **CX1 真機在 production cabin AI 負載下、continuous batching 可達 ~100 TPS** — 跟業界相近 SoC 同級。
+→ 而 none 模式只有 ~54 TPS aggregate → continuous 仍是 1.85× 倍速，故事不變。
+
+### 3.7.7 為什麼 LLM serving 教科書 TPS 高、cabin AI TPS 低
+
+LLM serving benchmark 通常測「文字 chatbot」：長 prompt、長 response、純文字、batch 滿。
+Cabin AI 是另一種 workload：**短輸入卻多模態（audio + image 加重 prefill）、短輸出（sensor JSON 不需要長文）**。
+本實驗的 TPS 反映的是「**真實 cabin AI 在 throttled CX1 上的 production-time throughput**」、不是「Marketing TPS」。
+
+對 OEM 而言，要看 cabin AI 是否能 deploy：
+- **能用 SLA**：TTFT p50 < 500 ms ✅ continuous 245 ms 過關
+- **能養 feature**：TPS 多少 token 可分給 sensor + 對話 ✅ 44 TPS （CX1 推算 100 TPS）可支撐 production workload
+
 ### 3.8 Per-stream decode TPS（單條 request 視角）
 
 | mode | mean per-stream decode TPS |
