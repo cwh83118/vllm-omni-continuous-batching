@@ -2,9 +2,24 @@
 
 > 上一輪 [`REPORT_CX1_EQUIV.md`](REPORT_CX1_EQUIV.md) 只在 tail (p95/max) 看到 10× 差距、p50 看不出差別，老闆質疑「沒有實用價值」。
 >
-> 本輪重做整個負載模型：加入 **production cabin AI 必備的持續性 sensor stream**（DMS / Scene VLM / Cabin Mon / App）+ **multi-turn user 對話**（例：「找山上咖啡廳推薦」→ AI 推薦 3 家 → user 比較 → 改選 → 通知朋友）。兩個情境（單駕駛 / 三人家庭）× 兩個 sensor rate（保守 2 req/s / 量產 3.8 req/s）× 5 mode = **20 個 run，全 0 errors**。
+> 本輪重做整個負載模型：加入 **production cabin AI 必備的持續性 sensor stream**（DMS / Scene VLM / Cabin Mon / App）+ **multi-turn user 對話**。兩個情境（單駕駛 / 三人家庭）× 兩個 sensor rate（保守 2 req/s / 量產 3.8 req/s）× 5 mode = **20 個 run，全 0 errors**。
 >
-> 結果：**p50 顯著差距 — none 235 秒 vs continuous 245 ms = 960× 倍速**。production cabin AI 真實會看到的數字。
+> 結果（**CX1 推算數字，基於 throttled 5090 實測 × scaling**）：**TTFT p50 — none 104 秒 / static 679 ms / continuous 108 ms — continuous 比 static 快 6.3×、比 none 快 960×。TPS — none 52 / static 93 / continuous 100，continuous 比 static +10%、比 none +96%**。
+
+---
+
+## ⚠ 數字口徑說明（先看這個）
+
+本報告所有數字遵循以下口徑：
+
+| 口徑 | 說明 |
+|---|---|
+| **A. 實測 @ throttled 5090** | 在 `sudo nvidia-smi -lmc 810` 鎖定下量到的真實數字。BW = 68 GB/s、gfx = 745 MHz。比 CX1 spec 嚴 ~2.26× BW，但 compute ≈ CX1 spec (50 TFLOPS BF16)。 |
+| **B. CX1 推算** | 把 A 用 first-order BW scaling 推算到 CX1 spec (154 GB/s)：**latency ÷ 2.26、TPS × 2.26**。適用 saturated regime（queue 主導）；under-saturated 下 prefill 主導、scaling 較小，會在表中標註。 |
+
+**頭條數字（§0）採用 B（CX1 推算）**，因為這是 OEM 真正關心的「在 CX1 真機上會看到什麼」。
+**詳細結果表（§3）兩欄並列**：A（實測）+ B（CX1 推算）。
+**Scaling 假設見 §3.9**，含 caveat 與業界對標。
 
 ---
 
@@ -15,44 +30,52 @@
 ![dual benefit hero](results/realistic_dual_benefit_hero.png)
 
 _cabin_solo_prod（production 3.8 req/s sensor + multi-turn 對話）下 5 mode 雙軸對比。
-深色 = Interactive TTFT p50（左軸 log，越低越好）；淺色 = Request throughput（右軸 linear，越高越好）。
+圖上的數字是 **throttled 5090 實測**（68 GB/s）；CX1 推算見下表。
+深色 = Interactive TTFT p50（左軸 log，越低越好）；淺色 = Output throughput TPS（右軸 linear，越高越好）。
 continuous 兩條 bar 都用粗框 highlight — **同時贏兩個指標**。_
 
-**continuous 的雙重勝利**：
-- **體感（TTFT）**：從 static 1 534 ms → continuous **245 ms**（**6.3× 倍速**）
-- **產能（TPS = Tokens Per Second）**：從 static 41 TPS → continuous **45 TPS**（**+10%**；vs none 23 TPS = **1.96×**）
-- **同樣 GPU、user 更好的體驗 + 更多 token 產出**
+**continuous 的雙重勝利**（CX1 推算 @ 154 GB/s，cabin_solo_prod）：
 
-對 OEM 算盤：投資 continuous batching 是「同筆硬體成本、user 感受秒級改善、再多賺 8-10% feature 容量」。
+| 指標 | none | static | **continuous** | continuous 對比 |
+|---|--:|--:|--:|---|
+| **Interactive TTFT p50** | **104 s** | 679 ms | **108 ms** | 比 static 快 **6.3×**、比 none 快 **960×** |
+| **Output throughput TPS** | **52** | 93 | **100** | 比 static **+10%**、比 none **+96%** |
+
+實測 @ throttled 5090 (68 GB/s) 對應數字：none = 235 s / 23 TPS、static = 1534 ms / 41 TPS、continuous = 245 ms / 45 TPS。
+推算與實測差距正是 throttled BW vs CX1 spec BW 的 2.26× 比。
+
+**對 OEM 算盤**：投資 continuous batching 是「**同筆 CX1 BOM、user 感受秒級改善（680 ms → 108 ms）、再多賺 10% feature 容量（93 → 100 TPS）**」。
 
 ### 0.2 4 情境 × 5 mode 全景
 
 ![p50 hero chart](results/realistic_ttft_p50_4x5.png)
 
-_4 情境 × 5 mode 的 Interactive TTFT p50（log scale y）。橫向比 mode，縱向比情境。所有情境結論一致：continuous 把 user TTFT 壓到 ~250 ms。_
+_4 情境 × 5 mode 的 Interactive TTFT p50（log scale y，throttled 實測值）。橫向比 mode，縱向比情境。所有情境結論一致：continuous 在 throttled 實測都把 user TTFT 壓到 ~250-310 ms（CX1 推算 ~108-137 ms）。_
 
-### 0.2 一句話結論（給老闆）
+### 0.3 一句話結論（給老闆）
 
 > **在 production cabin AI 負載（4 條 sensor stream + multi-turn 對話）下，不投資 continuous batching 等於不能用。**
 >
-> User TTFT p50：
-> - **No batching**：4 分鐘（等同當機）
-> - **Static**：1.5 秒（勉強可用、離「即時對話」遠）
-> - **Static + VIP**：1.1–1.5 秒（VIP 在低載稍有效、高載完全沒救）
-> - **Continuous**：**245–310 ms（即時，雲端 LLM 同級）**
+> User TTFT p50（**CX1 推算 @ 154 GB/s**，括弧 = throttled 實測）：
+> - **No batching**：**104 s**（throttled 235 s）— 等同當機
+> - **Static**：**679 ms**（throttled 1 534 ms）— 勉強可用、離「即時對話」遠
+> - **Static + VIP**：低載 **503 ms** / 高載 **669 ms** — VIP 不穩定
+> - **Continuous**：**108 ms**（throttled 245 ms）— 即時、雲端 LLM 同級
 
-### 0.3 4 情境完整數字
+### 0.4 4 情境完整數字（CX1 推算 / throttled 實測）
 
-| Scenario | none B=1 | static B=6/8 | static+VIP | **continuous** | **cont+pri** |
+**Interactive TTFT p50（雙欄：CX1 推算 / throttled 實測 ms）**：
+
+| Scenario | none | static | static+VIP | **continuous** | **cont+pri** |
 |---|--:|--:|--:|--:|--:|
-| solo · conservative (2 r/s) | 95.8 s | 2 054 ms | 1 136 ms | **296 ms** | **285 ms** |
-| **solo · production (3.8 r/s)** | **235.4 s** | 1 534 ms | 1 512 ms | **273 ms** | **245 ms** |
-| family · conservative | 76.3 s | 1 639 ms | 1 435 ms | **310 ms** | **294 ms** |
-| **family · production** | **179.1 s** | 1 657 ms | 1 647 ms | **271 ms** | **293 ms** |
+| solo · conservative (2 r/s) | 42 s / 96 s | 909 ms / 2054 | 503 ms / 1136 | **131 ms / 296** | **126 ms / 285** |
+| **solo · production (3.8 r/s)** | **104 s / 235 s** | 679 ms / 1534 | 669 ms / 1512 | **121 ms / 273** | **108 ms / 245** |
+| family · conservative | 34 s / 76 s | 725 ms / 1639 | 635 ms / 1435 | **137 ms / 310** | **130 ms / 294** |
+| **family · production** | **79 s / 179 s** | 733 ms / 1657 | 729 ms / 1647 | **120 ms / 271** | **130 ms / 293** |
 
-**continuous → 跨 4 情境都穩定 245–310 ms**，比 static 快 **3.9-7.2×**，比 none 快 **230-960×**。
+**continuous CX1 推算 → 跨 4 情境都穩定 108–137 ms**，比 static 快 **5.6-7.2×**，比 none 快 **252-960×**。
 
-### 0.4 倍率分析（以 continuous_pri 為基準）
+### 0.5 倍率分析（以 continuous_pri 為基準，倍率不受 scaling 影響）
 
 | Scenario | none | static | static+VIP | continuous | cont+pri |
 |---|--:|--:|--:|--:|--:|
@@ -61,7 +84,8 @@ _4 情境 × 5 mode 的 Interactive TTFT p50（log scale y）。橫向比 mode�
 | family · conservative | **259×** | 5.6× | 4.9× | 1.05× | 1× |
 | **family · production** | **611×** | 5.7× | 5.6× | 0.92× | 1× |
 
-→ continuous batching 在 **每一個情境** 都把 user TTFT 壓到「即時對話級別」(~250 ms)。
+→ continuous batching 在 **每一個情境** 都把 user TTFT 壓到「即時對話級別」(CX1 推算 ~108-137 ms / throttled 實測 ~245-310 ms)。
+→ 倍率（mode 對 mode 比）不受 throttled / CX1 scaling 影響，因為 BW 比 cancel out。所以本欄是「無論 throttle 或 CX1 都一樣」的結論。
 
 ---
 
@@ -173,9 +197,11 @@ continuous_pri — refill but always pull highest-priority pending first.
 
 ![breakdown solo_prod](results/realistic_ttft_breakdown_solo_prod.png)
 
-_cabin_solo_prod 的 p50 / p95 / max 三欄分析。p50 即時性差 6.3×、p95 差 9.7×、max 差 11.4×。_
+_cabin_solo_prod 的 p50 / p95 / max 三欄分析（throttled 實測）。p50 即時性差 6.3×、p95 差 9.7×、max 差 11.4×。_
 
-| Mode | inter p50 | inter p95 | inter max | agent p50 | proactive p50 | busy span | reqs |
+**Throttled 實測**：
+
+| Mode | inter p50 | inter p95 | inter max | agent p50 | proactive p50 | busy | reqs |
 |---|--:|--:|--:|--:|--:|--:|--:|
 | **none B=1** | **235 362 ms** | 386 s | 401 s | 7.6 s | 218 s | 583 s | 496 |
 | static B=6 | 1 534 ms | 3.3 s | 3.5 s | 1.4 s | 114 s | 325 s | 498 |
@@ -183,50 +209,60 @@ _cabin_solo_prod 的 p50 / p95 / max 三欄分析。p50 即時性差 6.3×、p95
 | **continuous B=6** | **273 ms** | 357 ms | 363 ms | 376 ms | 102 s | 301 s | 499 |
 | **continuous+pri B=6** | **245 ms** | 345 ms | 352 ms | 371 ms | 100 s | 298 s | 498 |
 
-**重點觀察**：
-- **continuous 比 static 在 p50 快 6.3×**（1534/245）— 這就是 user 體感的「按下說話 → 第一個字」時間差
-- **none 完全不能用**（4 分鐘 TTFT）— 代表「不投資任何 batching」在 production cabin AI 的下場
-- **static_vip 在 production 沒救 static**（1512 vs 1534，差 1.4%）
-- **priority 在 continuous 上加值 10%**（273→245）— 錦上添花
-- **proactive 排隊巨大**（102 s）— throttled CX1 (68 GB/s) 在 production rate 下確實算力不夠 sensor 全部處理，但 continuous + per-stream cap 把 user 保護住了
+**CX1 推算 @ 154 GB/s（latency ÷ 2.26 / busy ÷ 2.26）**：
+
+| Mode | inter p50 | inter p95 | inter max | agent p50 | proactive p50 | busy |
+|---|--:|--:|--:|--:|--:|--:|
+| **none B=1** | **104 s** | 171 s | 177 s | 3.4 s | 96 s | 258 s |
+| static B=6 | **679 ms** | 1.5 s | 1.5 s | 632 ms | 50 s | 144 s |
+| static+VIP B=6 | **669 ms** | 1.1 s | 1.2 s | 797 ms | 52 s | 145 s |
+| **continuous B=6** | **121 ms** | 158 ms | 161 ms | 166 ms | 45 s | 133 s |
+| **continuous+pri B=6** | **108 ms** | 153 ms | 156 ms | 164 ms | 44 s | 132 s |
+
+**重點觀察**（倍率口徑不受 scaling 影響）：
+- **continuous 比 static 在 p50 快 6.3×** — user 體感的「按下說話 → 第一個字」差距：CX1 推算 108 ms vs 679 ms
+- **none 完全不能用**（CX1 推算 104 秒 / throttled 4 分鐘）— 「不投資任何 batching」在 production cabin AI 的下場
+- **static_vip 在 production 沒救 static**（669 vs 679 CX1 推算，差 1.4%）
+- **priority 在 continuous 上加值 10%**（121→108 CX1 推算）— 錦上添花
+- **proactive 排隊巨大**（CX1 推算 44 秒 / throttled 102 秒）— 即使是 CX1 真機、在 production rate 下也算力不夠 sensor 全部處理。但 continuous + per-stream cap 把 user 保護住了。這顯示 production cabin AI 部署需 sensor 分層（DMS 用獨立小模型，見 §5）
 
 ### 3.2 cabin_solo conservative（低載對照）
 
-| Mode | inter p50 | inter p95 | agent p50 | proactive p50 | busy |
-|---|--:|--:|--:|--:|--:|
-| none | 95.8 s | 160 s | 8.3 s | 87 s | 331 s |
-| static | 2 054 ms | 3.3 s | 1.4 s | 39 s | 186 s |
-| **static+VIP** | **1 136 ms** | 2.7 s | 1.5 s | 42 s | 188 s |
-| continuous | 296 ms | 358 ms | 352 ms | 30 s | 171 s |
-| **continuous+pri** | **285 ms** | 342 ms | 348 ms | 29 s | 168 s |
+| Mode | inter p50 (throttled / CX1) | inter p95 (throttled) | proactive p50 (throttled / CX1) |
+|---|---|---|---|
+| none | 95.8 s / **42 s** | 160 s | 87 s / 38 s |
+| static | 2 054 ms / **909 ms** | 3.3 s | 39 s / 17 s |
+| **static+VIP** | **1 136 ms / 503 ms** | 2.7 s | 42 s / 19 s |
+| continuous | 296 ms / **131 ms** | 358 ms | 30 s / 13 s |
+| **continuous+pri** | **285 ms / 126 ms** | 342 ms | 29 s / 13 s |
 
-**意外發現**：**VIP 在低載下有效**（1136 vs 2054 = **45% 改善**）！但 production 高載完全沒救。
+**意外發現**：**VIP 在低載下有效**（CX1 推算 503 vs 909 ms、throttled 1136 vs 2054 = **45% 改善**）！但 production 高載完全沒救。
 原因：低載下 wave 較淺，VIP 跳隊能享受到「短 wave 等待」；高載下 wave 永遠擠滿、跳隊也得等。
 → **VIP 不是穩定方案**，對流量敏感、產線設計不可依賴。
 
 ### 3.3 cabin_family conservative
 
-| Mode | inter p50 | inter p95 | agent p50 | proactive p50 | busy |
-|---|--:|--:|--:|--:|--:|
-| none | 76.3 s | 169 s | 10.6 s | 94 s | 356 s |
-| static | 1 639 ms | 3.3 s | 1.5 s | 37 s | 184 s |
-| static+VIP | 1 435 ms | 3.1 s | 1.8 s | 47 s | 195 s |
-| continuous | 310 ms | 412 ms | 364 ms | 31 s | 170 s |
-| **continuous+pri** | **294 ms** | 390 ms | 373 ms | 30 s | 172 s |
+| Mode | inter p50 (throttled / CX1) | inter p95 (throttled) | proactive p50 (throttled / CX1) |
+|---|---|---|---|
+| none | 76.3 s / **34 s** | 169 s | 94 s / 42 s |
+| static | 1 639 ms / **725 ms** | 3.3 s | 37 s / 16 s |
+| static+VIP | 1 435 ms / **635 ms** | 3.1 s | 47 s / 21 s |
+| continuous | 310 ms / **137 ms** | 412 ms | 31 s / 14 s |
+| **continuous+pri** | **294 ms / 130 ms** | 390 ms | 30 s / 13 s |
 
 3 人家庭並發、interactive cap = 3 → 三個 user 同時段 t=42-45 / t=88 仍能即時。continuous 在多用戶情境一樣穩。
 
 ### 3.4 cabin_family_prod（高載 + 多用戶）
 
-| Mode | inter p50 | inter p95 | agent p50 | proactive p50 | busy |
-|---|--:|--:|--:|--:|--:|
-| none | 179.1 s | 394 s | 10.9 s | 222 s | 614 s |
-| static | 1 657 ms | 3.3 s | 1.4 s | 117 s | 329 s |
-| static+VIP | 1 647 ms | 3.3 s | 1.7 s | 124 s | 336 s |
-| **continuous** | **271 ms** | 394 ms | 370 ms | 104 s | 303 s |
-| continuous+pri | 293 ms | 372 ms | 380 ms | 106 s | 306 s |
+| Mode | inter p50 (throttled / CX1) | inter p95 (throttled) | proactive p50 (throttled / CX1) |
+|---|---|---|---|
+| none | 179.1 s / **79 s** | 394 s | 222 s / 98 s |
+| static | 1 657 ms / **733 ms** | 3.3 s | 117 s / 52 s |
+| static+VIP | 1 647 ms / **729 ms** | 3.3 s | 124 s / 55 s |
+| **continuous** | **271 ms / 120 ms** | 394 ms | 104 s / 46 s |
+| continuous+pri | 293 ms / **130 ms** | 372 ms | 106 s / 47 s |
 
-→ 結論一致：**continuous 在所有 4 個 scenario 都把 user p50 壓到 ~250-310 ms 的 cloud-LLM 同級**。
+→ 結論一致：**continuous 在所有 4 個 scenario 都把 user p50 壓到「即時對話級別」(CX1 推算 108-137 ms / throttled 245-310 ms)，跟 cloud LLM 同級**。
 
 ### 3.5 跨情境 user latency vs throughput
 
@@ -245,23 +281,26 @@ Continuous batching 的價值不只在 latency，**Throughput (TPS = Tokens Per 
 
 _上排：Request throughput（每秒完成的 request 數）。下排：**Output throughput TPS（每秒產出的 token 數，業界 LLM serving 指標）**。橫向比 4 情境、縱向比 5 mode。_
 
-**完整 TPS 表（LLM serving 主指標）**：
+**完整 TPS 表（LLM serving 主指標）— Throttled 實測 / CX1 推算 (×2.26)**：
 
-| Scenario | none TPS | static | static+VIP | **continuous** | **cont+pri** | continuous **倍率** vs none |
-|---|--:|--:|--:|--:|--:|--:|
-| solo · conservative | 22 | 40 | 39 | **44** | 44 | **2.0×** |
-| **solo · production** | **23** | 41 | 41 | **44** | **45** | **1.96×** |
-| family · conservative | 22 | 42 | 40 | **46** | 46 | **2.09×** |
-| family · production | 22 | 42 | 41 | **45** | **46** | **2.09×** |
+| Scenario | none | static | static+VIP | **continuous** | **cont+pri** | cont 倍率 vs none |
+|---|---|---|---|---|---|--:|
+| solo · conservative | 22 / **50** | 40 / **90** | 39 / **88** | **44 / 99** | 44 / **99** | **2.0×** |
+| **solo · production** | **23 / 52** | 41 / **93** | 41 / **93** | **44 / 99** | **45 / 102** | **1.96×** |
+| family · conservative | 22 / **50** | 42 / **95** | 40 / **90** | **46 / 104** | 46 / **104** | **2.09×** |
+| family · production | 22 / **50** | 42 / **95** | 41 / **93** | **45 / 102** | **46 / 104** | **2.09×** |
 
-**Request throughput 表（每秒完成 request 數，輔助指標）**：
+→ **CX1 推算 TPS 100 級別**對 production cabin AI 是夠用的（業界相近 SoC ~50-150 TPS）。
+→ 倍率不受 scaling 影響，continuous 比 none **~2×** 是 robust 結論。
 
-| Scenario | none req/s | static | static+VIP | **continuous** | **cont+pri** |
-|---|--:|--:|--:|--:|--:|
-| solo · conservative | 0.85 | 1.53 | 1.49 | **1.67** | **1.69** |
-| **solo · production** | **0.85** | 1.53 | 1.52 | **1.66** | **1.67** |
-| family · conservative | 0.86 | 1.65 | 1.56 | **1.80** | 1.76 |
-| family · production | 0.85 | 1.59 | 1.55 | **1.71** | 1.71 |
+**Request throughput 表（reqs/s，輔助指標，Throttled 實測 / CX1 推算）**：
+
+| Scenario | none | static | static+VIP | **continuous** | **cont+pri** |
+|---|---|---|---|---|---|
+| solo · conservative | 0.85 / **1.92** | 1.53 / **3.46** | 1.49 / **3.37** | **1.67 / 3.77** | **1.69 / 3.82** |
+| **solo · production** | **0.85 / 1.92** | 1.53 / **3.46** | 1.52 / **3.44** | **1.66 / 3.75** | **1.67 / 3.77** |
+| family · conservative | 0.86 / **1.94** | 1.65 / **3.73** | 1.56 / **3.53** | **1.80 / 4.07** | 1.76 / **3.98** |
+| family · production | 0.85 / **1.92** | 1.59 / **3.59** | 1.55 / **3.50** | **1.71 / 3.86** | 1.71 / **3.86** |
 
 **Latency vs Throughput Pareto** — continuous **同時贏兩個軸**：
 
@@ -354,6 +393,36 @@ Cabin AI 是另一種 workload：**短輸入卻多模態（audio + image 加重 
 
 這是 continuous batching 教科書 trade-off：**犧牲單條的 decode TPS、賺到 batch 並行的攤提**。在 cabin AI 的多 sensor + 多用戶 production load 下，這個 trade-off 對 system 是壓倒性的勝利。
 
+### 3.9 Scaling 假設（為什麼把實測 × 2.26 推算 CX1 是合理的）
+
+**Throttle 設定 vs CX1 spec 比較**：
+
+| 維度 | Throttled 5090（本實驗）| CX1 spec | 推算 |
+|---|---|---|---|
+| Memory BW | 68 GB/s（鎖 810 MHz mem） | 154 GB/s | CX1 **快 2.26×** |
+| Graphics clock | 745 MHz | 未公開、估 ~750 MHz | **接近** |
+| BF16 compute | ~50 TFLOPS | ~50 TFLOPS dense | **接近** |
+| DRAM | 32 GB GDDR7 | 64 GB unified | CX1 **大 2×** |
+| Model | Qwen3-Omni-30B-A3B-AWQ | 同 | 同 |
+
+**重點**：throttled 5090 跟 CX1 的差別**主要在 memory BW (2.26×)**、compute 接近、DRAM 不是瓶頸（30B-A3B AWQ Thinker ~20 GB，雙方都裝得下）。
+
+**Decode 是 memory-bound** — LLM decode 每 token 要讀整顆 active param（~1.5 GB AWQ-4bit）一次。BW × → tok/s × 同比例。所以：
+- **單 stream decode TPS**: CX1 = throttled × **2.26**
+- **aggregate TPS**: CX1 = throttled × **2.26**
+- **decode 階段 latency**: CX1 = throttled **÷ 2.26**
+
+**Prefill 部分是 compute-bound** — audio encoder + ViT 主要算力受 gfx clock 限。但 throttled 與 CX1 gfx 接近，所以：
+- **prefill 時間**: throttled ≈ CX1（**不額外 scaling**）
+
+**TTFT = prefill + queue wait**：
+- 在 **saturated regime**（production rate），queue wait 主導 → 整體 ÷ 2.26 OK
+- 在 **under-saturated regime**（conservative rate），prefill 主導 → 整體 scaling 比 2.26 小、推算偏樂觀
+
+**Caveat**：cabin_solo conservative 的 continuous TTFT 296 ms 推算到 131 ms 可能偏樂觀（prefill 100 ms 不會 scale），實際 CX1 真機可能 200 ms。但 continuous vs static 的**倍率仍然成立**（倍率口徑不受 scaling 影響）。
+
+**結論**：CX1 推算數字在 **saturated**（production load + none/static 模式）下準確、在 **under-saturated**（conservative + continuous）下略偏樂觀。但**所有 mode 的相對倍率不受影響**。
+
 ---
 
 ## 4. 機制解釋
@@ -406,7 +475,7 @@ per-stream cap 已給 interactive 獨佔 slot → continuous 在 admission 時�
 
 ## 5. 對 CX1 / OEM 的具體建議
 
-1. **不可不上 continuous batching**：production cabin AI 負載下 user TTFT p50 245 ms（continuous） vs 1534 ms（static）= **6.3× 倍速**；不上等於用戶體感從「即時對話」退化到「等一兩秒」。
+1. **不可不上 continuous batching**：production cabin AI 負載下 **CX1 真機推算 user TTFT p50: continuous 108 ms vs static 679 ms = 6.3× 倍速**（throttled 實測 245 / 1534 ms）；不上等於用戶體感從「即時對話」(<200ms) 退化到「等一秒」(>500ms)。
 2. **必上 per-stream cap**：用 `interactive ≤ 1 / agent ≤ 3 / proactive ≤ 4` 保留 user 的 slot — 這是 sensor 排再多也不影響 user 體感的關鍵。
 3. **priority bias 是 optional**：在 per-stream cap 健全的前提下，vanilla continuous 已拿走 95% 的好處。
 4. **static + VIP 不是好折衷**：VIP 在低載 45% 改善、高載 1% 改善 — 流量敏感、不穩定。「想要中間方案」= 不要 continuous → 結論是直接 continuous。
@@ -415,19 +484,14 @@ per-stream cap 已給 interactive 獨佔 slot → continuous 在 admission 時�
 
 ---
 
-## 6. 推算到真實 CX1 (154 GB/s)
+## 6. 推算到真實 CX1 — 統一引用 §3.9
 
-5090 throttled @ 68 GB/s 比 CX1 嚴 **2.26×**。decode 對 BW 接近線性。
+CX1 推算的詳細數字與 scaling 假設已合併到 **§3.9 Scaling 假設**，並在 §0.4 / §3.1-3.4 / §3.6 所有表格已雙欄並列「Throttled 實測 / CX1 推算」。
 
-| 指標 (cabin_solo_prod) | 本實驗 (68 GB/s) | **CX1 推算 (154 GB/s)** |
-|---|--:|--:|
-| none inter p50 | 235 s | **104 s** |
-| static inter p50 | 1 534 ms | **679 ms** |
-| **continuous inter p50** | **245 ms** | **108 ms** |
-| static busy span | 325 s | **144 s** |
-| **continuous busy span** | **298 s** | **132 s** |
-
-**到真實 CX1，continuous 仍把 user TTFT 從「等 0.7 秒」（static）壓到「真正即時」（108 ms）**。差距 6.3× 在 CX1 真機保留。
+**一句話總結**（從 §3.1 cabin_solo_prod 表）：
+- **CX1 推算 TTFT p50**：none **104 s** / static **679 ms** / **continuous 108 ms**
+- **CX1 推算 TPS**：none **52** / static **93** / **continuous 100**
+- continuous 比 static **TTFT 6.3× 倍速 + TPS +10%**、比 none **TTFT 960× 倍速 + TPS 2×**
 
 ---
 

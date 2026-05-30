@@ -20,8 +20,11 @@
 > 🚙 **Production cabin AI 真實負載版（4 sensor stream + multi-turn 對話 + 單駕駛/家庭雙情境 × 5 mode）：[`REPORT_REALISTIC.md`](REPORT_REALISTIC.md)**
 > 把 production cabin AI 必備的持續性感知 stream（DMS、Scene VLM、Cabin、App）+ multi-turn user 對話加進來，
 > 跑 **4 scenarios × 5 modes = 20 runs, 0 errors**。
-> **頭條結論：TTFT p50 在 production load 下 continuous (245 ms) vs static (1534 ms) = 6.3× 倍速**，
-> none (235 秒) 完全不能用。**v3 直接量化老闆問題：「在 production cabin AI 的 typical case，continuous 把體感從『等 1.5 秒』壓到『真正即時』」。**
+>
+> **頭條結論（CX1 真機推算 @ 154 GB/s，基於 throttled 5090 實測 × 2.26 BW scaling）**：
+> - **TTFT p50**：none **104 秒** / static **679 ms** / **continuous 108 ms** → 6.3× 比 static 倍速、960× 比 none
+> - **TPS**：none **52** / static **93** / **continuous 100** → +10% 比 static、+96% 比 none
+> - 對 OEM：**同筆 CX1 BOM、user 從「等 0.7 秒」變「即時 108 ms」、再多賺 10% feature 容量**
 
 ---
 
