@@ -35,13 +35,11 @@ def load(scenario, mode):
 def main():
     # extract metrics
     labels = [m[1] for m in MODES]
-    ttft_ms, throughput_rps, throughput_tps = [], [], []
+    ttft_ms, throughput_tps = [], []
     for mkey, _ in MODES:
         s = load(SCENARIO, mkey)
         v = s.get("interactive_ttft_p50_s")
         ttft_ms.append(0 if v is None or v != v else v * 1000)
-        n = s["n_requests_total"]; bs = s.get("busy_span_s", 0)
-        throughput_rps.append(n / bs if bs > 0 else 0)
         throughput_tps.append(s.get("busy_output_tok_per_s", 0))
 
     fig, ax_left = plt.subplots(figsize=(15, 7.5))
@@ -58,10 +56,10 @@ def main():
                          color=LEFT_COLORS, alpha=0.95,
                          edgecolor="#222", linewidth=0.8,
                          label="Interactive TTFT p50 (ms, log) — lower is better ↓")
-    bars_r = ax_right.bar(x + width/2, throughput_rps, width,
+    bars_r = ax_right.bar(x + width/2, throughput_tps, width,
                           color=RIGHT_COLORS, alpha=0.95,
                           edgecolor="#222", linewidth=0.8,
-                          label="Request throughput (reqs/s) — higher is better ↑")
+                          label="Output throughput TPS (tokens/s) — higher is better ↑")
 
     # value annotations
     for bar, v in zip(bars_l, ttft_ms):
@@ -70,9 +68,9 @@ def main():
         ax_left.text(bar.get_x() + bar.get_width()/2, v * 1.15,
                      txt, ha="center", va="bottom", fontsize=10.5,
                      fontweight="bold", color="#222")
-    for bar, v in zip(bars_r, throughput_rps):
-        ax_right.text(bar.get_x() + bar.get_width()/2, v + 0.04,
-                      f"{v:.2f} req/s", ha="center", va="bottom",
+    for bar, v in zip(bars_r, throughput_tps):
+        ax_right.text(bar.get_x() + bar.get_width()/2, v + max(throughput_tps)*0.02,
+                      f"{v:.0f} TPS", ha="center", va="bottom",
                       fontsize=10.5, fontweight="bold", color="#222")
 
     # highlight continuous group (best on both)
@@ -86,8 +84,8 @@ def main():
     ax_left.set_ylim(50, 2_000_000)
     ax_left.set_ylabel("Interactive TTFT p50 (ms, log scale)  ←  lower is better",
                        fontsize=12, color="#222")
-    ax_right.set_ylim(0, max(throughput_rps) * 1.45)
-    ax_right.set_ylabel("Request throughput (reqs/s)  →  higher is better",
+    ax_right.set_ylim(0, max(throughput_tps) * 1.30)
+    ax_right.set_ylabel("Output throughput TPS (tokens/s)  →  higher is better",
                         fontsize=12, color="#222")
 
     ax_left.set_xticks(x)
@@ -99,7 +97,7 @@ def main():
     fig.text(0.62, 0.78,
              "★ continuous wins BOTH axes ★\n"
              "  Latency: 245 ms (vs static 1534 ms → 6.3× faster)\n"
-             "  Throughput: 1.67 req/s (vs static 1.53 → +9%)\n"
+             "  Throughput: 45 TPS (vs static 41 → +10%; vs none 23 → 1.96×)\n"
              "  Same GPU, better user experience AND more work done.",
              fontsize=11, color="#1b5e20", fontweight="bold",
              bbox=dict(boxstyle="round,pad=0.6", facecolor="#e8f5e9",
@@ -108,7 +106,7 @@ def main():
     fig.text(0.04, 0.82,
              "✗ none is unusable\n"
              "  Latency: 235 s (3.9 min)\n"
-             "  Throughput: 0.85 req/s (½ of continuous)",
+             "  Throughput: 23 TPS (½ of continuous)",
              fontsize=10, color="#b71c1c", fontweight="bold",
              bbox=dict(boxstyle="round,pad=0.5", facecolor="#ffebee",
                        edgecolor="#b71c1c", linewidth=1.2))

@@ -19,9 +19,9 @@ _cabin_solo_prod（production 3.8 req/s sensor + multi-turn 對話）下 5 mode 
 continuous 兩條 bar 都用粗框 highlight — **同時贏兩個指標**。_
 
 **continuous 的雙重勝利**：
-- **體感**：TTFT p50 從 static 1534 ms → continuous **245 ms**（**6.3× 倍速**）
-- **產能**：throughput 從 static 1.53 req/s → continuous **1.67 req/s**（**+9%**）
-- **同樣 GPU、user 更好的體驗 + 更多工作做完**
+- **體感（TTFT）**：從 static 1 534 ms → continuous **245 ms**（**6.3× 倍速**）
+- **產能（TPS = Tokens Per Second）**：從 static 41 TPS → continuous **45 TPS**（**+10%**；vs none 23 TPS = **1.96×**）
+- **同樣 GPU、user 更好的體驗 + 更多 token 產出**
 
 對 OEM 算盤：投資 continuous batching 是「同筆硬體成本、user 感受秒級改善、再多賺 8-10% feature 容量」。
 
@@ -235,31 +235,33 @@ _cabin_solo_prod 的 p50 / p95 / max 三欄分析。p50 即時性差 6.3×、p95
 雙軸顯示 cabin_solo_prod 的 user TTFT p50（深色 log scale）+ busy span（淺色）。
 continuous：**6.3× faster user response AND ~2× shorter total processing**。
 
-### 3.6 Throughput — continuous batching 的第二大效益
+### 3.6 Throughput (TPS) — continuous batching 的第二大效益
 
-Continuous batching 的價值不只在 latency，**throughput (產能) 也直接決定 CX1 硬體投資回報**。
-同樣 GPU、continuous 比 static 處理 **多 7-15% 的請求/秒**、**多 8-12% 的 token/秒**。
-比 none 則是 **2× throughput**。意思是同樣的 CX1 BOM 成本，continuous 能跑更多功能、或同樣負載下硬體可降規。
+Continuous batching 的價值不只在 latency，**Throughput (TPS = Tokens Per Second) 也直接決定 CX1 硬體投資回報**。
+同樣 GPU、continuous 比 static **多 7-12% TPS**、比 none **2× TPS**。
+換句話說：**同樣 CX1 BOM 成本，continuous 能跑更多 feature、或同樣負載下硬體可降規**。
 
 ![throughput grid](results/realistic_throughput_bars.png)
 
-_上排：reqs/s（每秒完成的 request 數）。下排：tokens/s（每秒產出的總 token 數）。橫向比 4 個情境、縱向比 5 個 mode。_
+_上排：Request throughput（每秒完成的 request 數）。下排：**Output throughput TPS（每秒產出的 token 數，業界 LLM serving 指標）**。橫向比 4 情境、縱向比 5 mode。_
 
-**完整 throughput 表**：
+**完整 TPS 表（LLM serving 主指標）**：
 
-| Scenario | none req/s | static | static+VIP | **continuous** | **cont+pri** | continuous **倍率** vs none |
-|---|--:|--:|--:|--:|--:|--:|
-| solo · conservative | 0.85 | 1.53 | 1.49 | **1.67** | **1.69** | **1.96×** |
-| **solo · production** | **0.85** | 1.53 | 1.52 | **1.66** | **1.67** | **1.95×** |
-| family · conservative | 0.86 | 1.65 | 1.56 | **1.80** | 1.76 | **2.09×** |
-| **family · production** | **0.85** | 1.59 | 1.55 | **1.71** | 1.71 | **2.01×** |
-
-| Scenario | none tok/s | static | static+VIP | **continuous** | **cont+pri** | continuous **倍率** |
+| Scenario | none TPS | static | static+VIP | **continuous** | **cont+pri** | continuous **倍率** vs none |
 |---|--:|--:|--:|--:|--:|--:|
 | solo · conservative | 22 | 40 | 39 | **44** | 44 | **2.0×** |
 | **solo · production** | **23** | 41 | 41 | **44** | **45** | **1.96×** |
 | family · conservative | 22 | 42 | 40 | **46** | 46 | **2.09×** |
 | family · production | 22 | 42 | 41 | **45** | **46** | **2.09×** |
+
+**Request throughput 表（每秒完成 request 數，輔助指標）**：
+
+| Scenario | none req/s | static | static+VIP | **continuous** | **cont+pri** |
+|---|--:|--:|--:|--:|--:|
+| solo · conservative | 0.85 | 1.53 | 1.49 | **1.67** | **1.69** |
+| **solo · production** | **0.85** | 1.53 | 1.52 | **1.66** | **1.67** |
+| family · conservative | 0.86 | 1.65 | 1.56 | **1.80** | 1.76 |
+| family · production | 0.85 | 1.59 | 1.55 | **1.71** | 1.71 |
 
 **Latency vs Throughput Pareto** — continuous **同時贏兩個軸**：
 
@@ -269,34 +271,34 @@ _橫軸 throughput（越右越好）、縱軸 TTFT p50（越下越好、log scal
 
 **對 OEM 的雙重價值（同一筆投資、兩個 KPI 一起改善）**：
 
-1. **User latency 6× 改善**（245 ms vs 1534 ms）— 體感從「等」變「即時」
-2. **System throughput 2× 改善 vs none, 8-12% 改善 vs static** — 同樣 CX1 BOM 可多跑 8% 功能、或目前負載下可降規
+1. **User latency 6.3× 改善**（245 ms vs 1534 ms）— 體感從「等」變「即時」
+2. **TPS 1.96× 改善 vs none、+10% 改善 vs static** — 同樣 CX1 BOM 可多跑 10% 功能、或目前負載下可降規
 
 換成具體的 OEM 算盤：
 - 假設 CX1 BOM 成本 X、上 continuous 把 user response 從 1.5 s 壓到 0.25 s
-- 同時還能多塞 8-12% 的 feature（多一個 sensor stream、多 1 個 AI 主動建議）
+- 同時 TPS 從 41 → 45（+10%），可多塞 10% 的 feature（多一個 sensor stream、多 1 個 AI 主動建議）
 - 完全沒額外硬體成本
 
-### 3.7 為什麼 throughput 改善 (8%) 比 latency 改善 (6×) 小
+### 3.7 為什麼 TPS 改善 (10%) 比 latency 改善 (6.3×) 小
 
-關鍵：throughput 取的是**全期間平均**、latency 取的是**user 等待 distribution 的 p50**。
+關鍵：TPS 取的是**全期間平均**、latency 取的是**user 等待 distribution 的 p50**。
 
-- static B=6 與 continuous B=6 都會吃滿 batch（在 saturated regime），所以 **aggregate throughput 接近**
+- static B=6 與 continuous B=6 都會吃滿 batch（在 saturated regime），所以 **aggregate TPS 接近**
 - 但 static 的「等下一波」造成 user 在隊伍中等 1.5 s、continuous 在 245 ms — 同樣的總工作量，**不同的 user 體感分配**
 
-→ continuous **不是讓 GPU 工作更努力**（已經 ~100% 滿），而是**重新分配 GPU 的時間給「使用者更急切的需求」**。throughput 邊際改善（fill batch 效率）、user latency 大改善（slot 立刻補 vs 等 wave drain）。
+→ continuous **不是讓 GPU 工作更努力**（已經 ~100% 滿），而是**重新分配 GPU 的時間給「使用者更急切的需求」**。TPS 邊際改善（fill batch 效率）、user latency 大改善（slot 立刻補 vs 等 wave drain）。
 
-### 3.8 Per-stream decode tok/s（單條 request 視角）
+### 3.8 Per-stream decode TPS（單條 request 視角）
 
-| Scenario · mode | mean per-stream decode tok/s |
+| mode | mean per-stream decode TPS |
 |---|--:|
-| any mode · none | **24.2** ← 每條 request 獨享全 BW |
-| any mode · static | 11-13 |
-| any mode · continuous | **10-11** ← 6 條 request 共享 BW |
+| **none** | **24.2** ← 每條 request 獨享全 BW |
+| static | 11-13 |
+| **continuous** | **10-11** ← 6 條 request 共享 BW |
 
-**個別 request 的 decode 速度，static 跟 continuous 都比 none 慢一半**（因為 BW 被 batch 分掉）。但 **aggregate 是 batch 模式贏**（2× 倍速完成所有工作）。
+**個別 request 的 decode TPS，static 跟 continuous 都比 none 慢一半**（因為 BW 被 batch 分掉）。但 **aggregate TPS 是 batch 模式贏**（44-46 vs 22-23 TPS = ~2× 倍速）。
 
-這是 continuous batching 教科書 trade-off：**犧牲單條的 decode 速度、賺到 batch 並行的攤提**。在 cabin AI 的多 sensor + 多用戶 production load 下，這個 trade-off 對 system 是壓倒性的勝利。
+這是 continuous batching 教科書 trade-off：**犧牲單條的 decode TPS、賺到 batch 並行的攤提**。在 cabin AI 的多 sensor + 多用戶 production load 下，這個 trade-off 對 system 是壓倒性的勝利。
 
 ---
 
