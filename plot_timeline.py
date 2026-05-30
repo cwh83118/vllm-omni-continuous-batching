@@ -29,9 +29,11 @@ COL = {
     "agent":       {"wait": "#bce6dc", "gen": "#2a9d8f"},   # teal   — multi-turn tool-loop
 }
 MODE_TITLE = {
-    "none":       "(1) NO batching  — max 1 in flight (≡ max_num_seqs=1)",
-    "static":     "(2) STATIC / fixed-batch  — NPU-style: a wave of ≤B runs to drain before the next wave can start",
-    "continuous": "(3) CONTINUOUS batching  — ≤B in flight, refill the instant a slot frees (vLLM-Omni)",
+    "none":           "(1) NO batching  — max 1 in flight (serial)",
+    "static":         "(2) STATIC / fixed-batch  — NPU-style: wave of ≤B drains before next wave can start",
+    "static_vip":     "(3) STATIC + Interactive VIP  — wave drain; interactive jumps queue + runs ALONE (B=1, full GPU)",
+    "continuous":     "(4) CONTINUOUS batching  — ≤B in flight, FIFO refill the instant a slot frees",
+    "continuous_pri": "(5) CONTINUOUS + Priority  — refill but interactive > agent > proactive",
 }
 
 
@@ -97,9 +99,11 @@ def draw_concurrency_strip(ax, data, xmax, mode_color):
 
 
 MODE_STRIP_COLOR = {
-    "none":       "#b71c1c",
-    "static":     "#ef6c00",
-    "continuous": "#2e7d32",
+    "none":           "#b71c1c",   # red
+    "static":         "#ef6c00",   # orange
+    "static_vip":     "#7b1fa2",   # purple — highlights "interactive jumps queue, runs alone"
+    "continuous":     "#2e7d32",   # green
+    "continuous_pri": "#00695c",   # dark teal — green family + priority signal
 }
 
 
@@ -107,8 +111,8 @@ def draw_panel(ax, data, title, shared_xmax=None):
     reqs = sorted(data["requests"], key=lambda r: (r["t_submit"], r["brain"], r["idx"]))
     xmax = shared_xmax or max((r["t_finish"] for r in reqs if r["t_finish"]), default=1.0)
 
-    # wave-start vertical lines (static mode)
-    if data.get("mode") == "static":
+    # wave-start vertical lines (static / static_vip mode)
+    if data.get("mode") in ("static", "static_vip"):
         waves = {}
         for r in reqs:
             w = r.get("wave_id", -1)
@@ -160,7 +164,7 @@ def draw_panel(ax, data, title, shared_xmax=None):
             ax.text(t_f + xmax * 0.006, y, txt, va="center", ha="left", fontsize=6, color="#444")
 
     ax.set_xlim(0, xmax * 1.12)
-    ax.set_ylim(-0.7, len(reqs) - 0.3 + (1.0 if data.get("mode") == "static" else 0.0))
+    ax.set_ylim(-0.7, len(reqs) - 0.3 + (1.0 if data.get("mode") in ("static", "static_vip") else 0.0))
     ax.set_yticks([])
     ax.tick_params(axis="x", labelbottom=False)   # x-axis labels live on the strip below
     s = data["summary"]

@@ -29,12 +29,29 @@ from dataclasses import dataclass
 
 TOOL_CATALOG_TEXT = """\
 可用工具（每一輪只能呼叫其中一個）：
-- navigate_to_poi(poi_id): poi_id ∈ {"restaurant","shopping","beach","gas_station","cafe","home"}
+# 既有 6 個（cabin 控制 + POI）
+- navigate_to_poi(poi_id): poi_id ∈ {"restaurant","shopping","beach","gas_station","cafe","home","child_school","piano_school","supermarket"}
 - control_windows(window, action): window ∈ {"all","front_left","front_right","rear_left","rear_right"}, action ∈ {"open","close"}
 - set_climate(temperature, fan_speed): temperature in °C (16-30), fan_speed ∈ {"low","mid","high","auto"}
-- play_music(query): query 是字串，例如 "輕快歌單" 或 "抒情音樂"
-- find_nearby(type, radius_km): type ∈ {"restaurant","gas_station","cafe","shopping","beach","parking"}, radius_km in 1..20
+- play_music(query): query 是字串，例如 "小明喜歡的歌單"
+- find_nearby(type, radius_km): type ∈ {"restaurant","gas_station","cafe","shopping","supermarket","parking"}, radius_km in 1..20
 - order_food(restaurant, items): restaurant 是字串，items 是字串陣列
+# 新增 10 個（行事曆 / 通訊錄 / 訊息 / 地圖規劃 / 視覺 / App）
+- get_calendar(date): date 例 "today"；回傳當日待辦事件列表
+- get_contacts(name_or_relation): 例 "小明" 或 "child"；回傳聯絡卡
+- send_message(contact, body): contact 名字、body 文字；回傳 ok/failed
+- check_messages(): 回傳當前未讀訊息列表
+- get_weather(location): location 例 "current"；回傳天氣 + 預報
+- predict_traffic(origin, destination): 回傳 ETA + 替代路線
+- predict_eta(destination): 回傳剩餘時間 + 即時路況
+- find_pois_along_route(route_id, type): 沿路線找 POI，回傳列表 + 各 POI 繞行 km
+- optimize_route(pois, route_id, prefs): 排序 + 詳細路徑
+- get_user_preferences(user, category): 回傳偏好（音樂 / 飲食 / 路徑 等）
+- arriving_at(poi_id): 回傳抵達確認 + 後續建議
+- cabin_vision(focus): focus 例 "driver", "rear_seat"；回傳描述
+- outside_vision(direction): direction ∈ {"front","rear","left","right"}；回傳描述
+- cabin_voice_diarize(): 回傳當前發話人 + 摘要
+- set_reminder(time, body): 設提醒，回傳 ok
 
 輸出規範：每一輪只能輸出以下兩種之一（單一行 JSON，不要解釋）：
   (A) 工具呼叫：<tool_call>{"name":"<工具名>","args":{...}}</tool_call>
@@ -86,18 +103,23 @@ def parse_step_output(text: str) -> StepResult:
 # ----- deterministic mock tool executor ---------------------------------------
 
 _POI_TABLE = {
-    "restaurant":  {"name": "星光米其林餐廳", "eta_min": 7,  "distance_km": 2.3},
-    "shopping":    {"name": "濱海購物中心",   "eta_min": 12, "distance_km": 4.2},
-    "beach":       {"name": "藍灣海灘",       "eta_min": 20, "distance_km": 8.0},
-    "gas_station": {"name": "中油忠孝站",     "eta_min": 4,  "distance_km": 1.4},
-    "cafe":        {"name": "Cafe Reverie",   "eta_min": 5,  "distance_km": 1.7},
-    "home":        {"name": "回家",            "eta_min": 18, "distance_km": 6.5},
+    "restaurant":   {"name": "星光米其林餐廳", "eta_min": 7,  "distance_km": 2.3},
+    "shopping":     {"name": "濱海購物中心",   "eta_min": 12, "distance_km": 4.2},
+    "beach":        {"name": "藍灣海灘",       "eta_min": 20, "distance_km": 8.0},
+    "gas_station":  {"name": "中油忠孝站",     "eta_min": 4,  "distance_km": 1.4},
+    "cafe":         {"name": "Cafe Reverie",   "eta_min": 5,  "distance_km": 1.7},
+    "home":         {"name": "回家",            "eta_min": 18, "distance_km": 6.5},
+    "child_school": {"name": "光明國小",       "eta_min": 13, "distance_km": 5.2},
+    "piano_school": {"name": "Yamaha 鋼琴教室", "eta_min": 10, "distance_km": 3.9},
+    "supermarket":  {"name": "全聯成功店",     "eta_min": 8,  "distance_km": 3.1},
+    "parking":      {"name": "停車場",         "eta_min": 1,  "distance_km": 0.2},
 }
 
 
 async def mock_tool_executor(name: str, args: dict) -> dict:
     """Return a deterministic JSON result + a tiny artificial latency."""
     await asyncio.sleep(0.005)  # 5 ms — visible on the timeline but doesn't dominate
+    # === existing 6 tools ===
     if name == "navigate_to_poi":
         poi = _POI_TABLE.get(args.get("poi_id", "restaurant"), _POI_TABLE["restaurant"])
         return {"status": "navigating", "destination": poi["name"],
@@ -117,6 +139,67 @@ async def mock_tool_executor(name: str, args: dict) -> dict:
     if name == "order_food":
         return {"status": "reserved", "restaurant": args.get("restaurant", "星光米其林餐廳"),
                 "time": "19:00", "items": args.get("items", []) or ["主廚推薦"]}
+    # === 10 new tools for commute_run ===
+    if name == "get_calendar":
+        return {"date": args.get("date", "today"),
+                "events": [
+                    {"time": "17:55", "title": "接小明放學", "location": "child_school"},
+                    {"time": "18:10", "title": "送小明鋼琴課", "location": "piano_school"},
+                    {"time": "19:30", "title": "接小明下鋼琴課", "location": "piano_school"},
+                ]}
+    if name == "get_contacts":
+        return {"name": args.get("name_or_relation", "小明"),
+                "relation": "child", "phone": "0912****34",
+                "preferences": {"music": "兒童歌曲歌單", "snack": "牛奶餅乾"}}
+    if name == "send_message":
+        return {"status": "sent", "contact": args.get("contact", "小明"),
+                "body": args.get("body", "")[:60]}
+    if name == "check_messages":
+        return {"unread": [
+            {"from": "鋼琴老師", "preview": "今天活動延 5 min"},
+            {"from": "老公", "preview": "今晚煮義大利麵嗎？"},
+        ]}
+    if name == "get_weather":
+        return {"location": args.get("location", "current"),
+                "now": "rain", "next_hour": "rain_stop", "temp_c": 22}
+    if name == "predict_traffic":
+        return {"origin": args.get("origin", "current"),
+                "destination": args.get("destination", "child_school"),
+                "eta_min": 13, "alternates": ["XX 路 (省 2 min)"]}
+    if name == "predict_eta":
+        return {"destination": args.get("destination", "piano_school"),
+                "eta_min": 12, "arrive_early_min": 3}
+    if name == "find_pois_along_route":
+        return {"route_id": args.get("route_id", "current"),
+                "type": args.get("type", "supermarket"),
+                "pois": [
+                    {"id": "fl_chenggong", "name": "全聯成功店", "detour_m": 200, "eta_min": 8},
+                    {"id": "px_mart_anhe", "name": "PX Mart 安和店", "detour_m": 450, "eta_min": 11},
+                ]}
+    if name == "optimize_route":
+        return {"order": ["child_school", "fl_chenggong", "piano_school"],
+                "total_min": 28, "stops": 3}
+    if name == "get_user_preferences":
+        u = args.get("user", "driver"); c = args.get("category", "grocery")
+        prefs = {"grocery": "全聯", "music": "輕音樂", "route": "省時"}
+        if u in ("小明", "child"):
+            prefs = {"music": "兒童歌曲歌單", "snack": "牛奶餅乾"}
+        return {"user": u, "category": c, "value": prefs.get(c, "default")}
+    if name == "arriving_at":
+        return {"poi_id": args.get("poi_id", "supermarket"),
+                "status": "arrived", "next": "parking_assist"}
+    if name == "cabin_vision":
+        return {"focus": args.get("focus", "driver"),
+                "description": "駕駛狀態正常、後座小孩坐穩"}
+    if name == "outside_vision":
+        return {"direction": args.get("direction", "front"),
+                "description": "前方塞車 200m"}
+    if name == "cabin_voice_diarize":
+        return {"speakers": [{"id": "child", "name": "小明", "summary": "在分享今天畫畫"}],
+                "duration_s": 12}
+    if name == "set_reminder":
+        return {"status": "ok", "time": args.get("time", "19:30"),
+                "body": args.get("body", "")[:60]}
     return {"status": "unknown_tool", "name": name}
 
 

@@ -10,6 +10,12 @@
 > 在原版（純文字、固定 B=8）的基礎上把輸入換成 **真實 audio + image + 車輛 JSON**、interactive 升級成 **多步 tool-loop agent**、
 > 跑了 **55 個 sweep run**（5 情境 × 3 mode × B {1,2,4,8,16}），並在每張 timeline 下方加了 **in-flight count over time** 條，
 > 讓「哪些 request 同時在 GPU 上被一起 decode」一眼看得出來。
+>
+> 👩‍👦 **CX1 等效實測版（真實單一駕駛 3 分鐘劇本 + 5090 throttle 到 CX1 BW + 5 mode 對比）：[`REPORT_CX1_EQUIV.md`](REPORT_CX1_EQUIV.md)**
+> 媽媽下班接小孩→送才藝→買菜的真實通勤劇本，把 5090 鎖 memory clock 到 810 MHz (BW ≈ 68 GB/s)，
+> 比較 **none / static / static + VIP / continuous / continuous + priority** 5 種排程方式。
+> **頭條結論：TTFT p50 看不出差別 (~110 ms 一致)，但 TTFT p95 是 1952 ms (static) vs 189 ms (continuous) — 10× 差距**。
+> 對老闆問題「投資 continuous batching 帶來怎樣的體感效益」的直接量化答案：**5% 的時刻從「等 2 秒」變「200 ms 即時」**。
 
 ---
 

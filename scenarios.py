@@ -41,6 +41,7 @@ class ScenarioSpec:
     agent_launches: tuple[AgentLaunch, ...] = field(default_factory=tuple)
     burst_n: int = 0                 # if >0, run text-only single-turn burst (no proactive, no agent)
     burst_max_tokens: int = 180
+    use_commute_script: bool = False  # if True, drive arrivals from commute_script.COMMUTE_EVENTS
 
 
 SCENARIOS: dict[str, ScenarioSpec] = {
@@ -86,6 +87,12 @@ SCENARIOS: dict[str, ScenarioSpec] = {
         proactive_enabled=False,
         burst_n=24,
         burst_max_tokens=180,
+    ),
+    "commute_run": ScenarioSpec(
+        name="commute_run",
+        duration_s=200.0,                # 180 s script + 20 s drain
+        proactive_enabled=False,         # actually driven by commute_script, this flag is ignored
+        use_commute_script=True,
     ),
 }
 

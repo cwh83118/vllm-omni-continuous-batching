@@ -107,6 +107,8 @@ class Req:
     n_audio_sec: float = 0.0       # duration of audio attached to this request
     n_image: int = 0               # how many images attached
     full_messages: list = None     # if set, overrides sys_prompt+user_prompt above
+    priority: int = 3              # 1 = interactive (top), 2 = agent, 3 = proactive
+    event_idx: int = -1            # commute_run only: which COMMUTE_EVENTS entry triggered this
     # ---- timestamps & accounting ----
     t_submit: float = 0.0       # entered the client queue (= "arrived")
     t_admitted: float = 0.0     # left the queue, request actually started
@@ -184,24 +186,38 @@ async def run_request(client, model, req: Req, t0: float, seed: int, log):
 # --------------------------------------------------------------------- admission controller
 
 class Dispatcher:
-    """Client-side admission controller emulating the three scheduling regimes."""
+    """Client-side admission controller emulating five scheduling regimes:
+
+      none           — B=1 strict serial. Priority irrelevant.
+      static         — wave drain (≤B per wave); within a wave priority-sorted.
+      static_vip     — wave drain + interactive jumps to its OWN wave, runs alone (B=1).
+      continuous     — vanilla FIFO refill; ≤B in flight at all times.
+      continuous_pri — refill but always pull highest-priority pending first.
+
+    All modes additionally enforce per-stream concurrency caps:
+        interactive ≤ 1, agent ≤ 3, proactive ≤ 2  (total still ≤ B).
+    """
+
+    PRIORITY = {"interactive": 1, "agent": 2, "proactive": 3}
+    PER_STREAM_CAP = {"interactive": 1, "agent": 3, "proactive": 2}
 
     def __init__(self, client, args, t0, log):
         self.client = client
         self.args = args
         self.t0 = t0
         self.log = log
-        self.mode = args.mode                       # none | static | continuous
+        self.mode = args.mode                       # none | static | static_vip | continuous | continuous_pri
         self.B = 1 if self.mode == "none" else max(1, args.batch_size)
-        self.wave_mode = self.mode in ("none", "static")   # "drain whole wave before next"
-        self.pending: list[Req] = []                # arrived, not yet admitted
+        self.wave_mode = self.mode in ("none", "static", "static_vip")
+        self.priority_aware = self.mode in ("static_vip", "continuous_pri")
+        self.pending: list[Req] = []
         self.in_flight: set[asyncio.Task] = set()
-        self.reqs: list[Req] = []                   # all Req objects, in arrival order
+        self.in_flight_by_brain: dict[str, int] = {"interactive": 0, "agent": 0, "proactive": 0}
+        self.vip_active: bool = False               # static_vip: current wave is a VIP wave
+        self.reqs: list[Req] = []
         self.kick = asyncio.Event()
         self.arrivals_done = False
         self.wave_counter = 0
-        # Per-request completion events — used by agent_loop to await one step
-        # before launching the next. Keyed by req.rid.
         self.done_events: dict[str, asyncio.Event] = {}
 
     def submit(self, req: Req):
@@ -235,31 +251,79 @@ class Dispatcher:
         task = asyncio.create_task(run_request(self.client, self.args.model, req, self.t0, seed, self.log))
         task.add_done_callback(lambda t, r=req: self._on_done(t, r))
         self.in_flight.add(task)
+        self.in_flight_by_brain[req.brain] = self.in_flight_by_brain.get(req.brain, 0) + 1
 
     def _on_done(self, task, req: Req):
         self.in_flight.discard(task)
+        self.in_flight_by_brain[req.brain] = max(0, self.in_flight_by_brain.get(req.brain, 0) - 1)
+        if self.vip_active and not self.in_flight:
+            self.vip_active = False
         ev = self.done_events.get(req.rid)
         if ev is not None:
             ev.set()
         self.kick.set()
 
+    def _sort_pending_by_priority(self) -> list[Req]:
+        """Return a stable priority-sorted copy of pending (no mutation)."""
+        return sorted(self.pending,
+                      key=lambda r: (self.PRIORITY.get(r.brain, 9), r.t_submit))
+
+    def _stream_cap_ok(self, req: Req) -> bool:
+        cap = self.PER_STREAM_CAP.get(req.brain)
+        return cap is None or self.in_flight_by_brain.get(req.brain, 0) < cap
+
     def _maybe_admit(self):
+        # --- wave-style modes ---
         if self.wave_mode:
-            # admit a new wave (size up to B) only when nothing is in flight
             if self.in_flight or not self.pending:
                 return
-            n = min(self.B, len(self.pending))
-            wid = self.wave_counter
-            self.wave_counter += 1
+
+            # static_vip: if any interactive in pending, run it ALONE in a VIP wave.
+            if self.mode == "static_vip":
+                vip = next((r for r in self.pending if r.brain == "interactive"), None)
+                if vip is not None:
+                    self.pending.remove(vip)
+                    wid = self.wave_counter; self.wave_counter += 1
+                    self.vip_active = True
+                    self.log(f"[t={time.monotonic() - self.t0:6.2f}s] "
+                             f"--- VIP wave #{wid}: interactive {vip.rid} alone (full GPU) ---")
+                    self._start(vip, wave_id=wid)
+                    return
+
+            # regular wave: priority-sorted pick (interactive first if any), respect per-stream caps
+            order = self._sort_pending_by_priority() if self.priority_aware else list(self.pending)
+            picked: list[Req] = []
+            picked_brains = {"interactive": 0, "agent": 0, "proactive": 0}
+            for r in order:
+                if len(picked) >= self.B:
+                    break
+                cap = self.PER_STREAM_CAP.get(r.brain, self.B)
+                if picked_brains[r.brain] >= cap:
+                    continue
+                picked.append(r)
+                picked_brains[r.brain] += 1
+            if not picked:
+                return
+            wid = self.wave_counter; self.wave_counter += 1
             had = len(self.pending)
-            if self.mode == "static":
-                self.log(f"[t={time.monotonic() - self.t0:6.2f}s] --- wave #{wid}: admitting {n} req "
-                         f"(pending was {had}) ---")
-            for _ in range(n):
-                self._start(self.pending.pop(0), wave_id=wid)
-        else:  # continuous: keep up to B in flight, refilling the instant a slot frees
-            while len(self.in_flight) < self.B and self.pending:
-                self._start(self.pending.pop(0), wave_id=-1)
+            if self.mode in ("static", "static_vip"):
+                self.log(f"[t={time.monotonic() - self.t0:6.2f}s] --- wave #{wid}: admitting {len(picked)} req "
+                         f"(pending was {had}, by brain {picked_brains}) ---")
+            for r in picked:
+                self.pending.remove(r)
+                self._start(r, wave_id=wid)
+            return
+
+        # --- continuous modes ---
+        # iterate pending in priority order (or FIFO for vanilla continuous)
+        order = self._sort_pending_by_priority() if self.priority_aware else list(self.pending)
+        for r in order:
+            if len(self.in_flight) >= self.B:
+                break
+            if not self._stream_cap_ok(r):
+                continue
+            self.pending.remove(r)
+            self._start(r, wave_id=-1)
 
     async def run(self):
         while True:
@@ -391,6 +455,97 @@ def _next_agent_step_counter() -> int:
     return v
 
 
+# === commute_run: the 180s mom-pickup scenario =============================
+
+async def commute_arrivals(disp: Dispatcher, args, t0):
+    """Drive arrivals from commute_script.COMMUTE_EVENTS.
+
+    Each event is scheduled at its event.t. Behavior by kind:
+      - proactive:    submit one multimodal Req at time t.
+      - interactive:  if event has agent_task_text, treat utterance as the kick-off
+                      of an agent task → submit step-0 (with audio) then continue
+                      tool-loop. Otherwise, single-turn audio Q&A.
+      - agent (pure): no audio, kick off an agent tool-loop driven by agent_task_text.
+    """
+    import commute_script
+    from agent_loop import run_agent_task
+
+    proa_counter = [0]; inter_counter = [0]; agent_counter = [0]
+
+    async def fire_event(ev):
+        nonlocal proa_counter, inter_counter, agent_counter
+        # sleep to event time
+        target = ev.t
+        now = time.monotonic() - t0
+        if target > now:
+            await asyncio.sleep(target - now)
+
+        if ev.kind == "proactive":
+            i = proa_counter[0]; proa_counter[0] += 1
+            blocks = assets_loader.commute_content_blocks("proactive", ev.idx, with_image=True)
+            audio_sec = assets_loader.load_commute_audio("proactive", ev.idx).duration_s
+            disp.submit(Req(rid=f"P{i}", brain="proactive", idx=i, gidx=_next_gidx(),
+                            sys_prompt=PROACTIVE_SYSTEM_AUDIO, user_prompt=blocks,
+                            brain_subtype="proactive_commute",
+                            n_audio_sec=audio_sec, n_image=1,
+                            event_idx=ev.idx, priority=ev.priority,
+                            max_tokens=ev.max_tokens, temperature=0.3))
+            return
+
+        if ev.kind in ("interactive", "agent"):
+            # Both kick off an agent tool-loop. interactive has audio; agent has none.
+            task_global_id = f"{'I' if ev.kind == 'interactive' else 'A'}{(inter_counter[0] if ev.kind=='interactive' else agent_counter[0])}"
+            if ev.kind == "interactive":
+                inter_counter[0] += 1
+            else:
+                agent_counter[0] += 1
+            audio_blocks_step0 = (
+                (lambda e=ev: assets_loader.commute_content_blocks("interactive", e.idx, with_image=False))
+                if ev.kind == "interactive"
+                else (lambda e=ev: [{"type": "text",
+                                     "text": "（系統內部主動任務）" + e.agent_task_text}])
+            )
+
+            async def submit_step(*, step_idx, parent_rid, messages, max_tokens,
+                                  temperature, gidx, audio_seconds):
+                rid = f"{task_global_id}_s{step_idx}"
+                if ev.kind == "interactive" and step_idx == 0:
+                    audio_sec = assets_loader.load_commute_audio("interactive", ev.idx).duration_s
+                else:
+                    audio_sec = 0.0
+                # Brain tagging: keep step 0 of "interactive" tagged interactive
+                # so per-stream cap (interactive ≤ 1) protects user latency.
+                # Tag follow-up steps as "agent" so they share the agent pool.
+                if ev.kind == "interactive" and step_idx == 0:
+                    brain_tag = "interactive"
+                    pri = 1
+                else:
+                    brain_tag = "agent"
+                    pri = 2
+                req = Req(rid=rid, brain=brain_tag, idx=step_idx,
+                          gidx=gidx,
+                          sys_prompt="", user_prompt="",
+                          brain_subtype=f"{ev.kind}_step{step_idx}",
+                          parent_rid=task_global_id, step_idx=step_idx,
+                          n_audio_sec=audio_sec, n_image=0,
+                          full_messages=messages,
+                          event_idx=ev.idx, priority=pri,
+                          max_tokens=max_tokens, temperature=temperature)
+                return await disp.submit_and_await(req)
+
+            await run_agent_task(
+                submit_step=submit_step,
+                task_idx=ev.idx,
+                task_global_id=task_global_id,
+                audio_blocks_step0=audio_blocks_step0,
+                next_gidx=_next_gidx,
+                log=disp.log,
+            )
+
+    coros = [fire_event(ev) for ev in commute_script.COMMUTE_EVENTS]
+    await asyncio.gather(*coros)
+
+
 async def burst_arrivals(disp: Dispatcher, args, t0):
     await asyncio.sleep(1.0)
     disp.log(f"[t={time.monotonic()-t0:6.2f}s] --- BURST: {args.burst} requests arrive at once ---")
@@ -498,7 +653,8 @@ def print_table(s):
 
 async def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["none", "static", "continuous"], default="continuous",
+    ap.add_argument("--mode", choices=["none", "static", "static_vip", "continuous", "continuous_pri"],
+                    default="continuous",
                     help="scheduling regime to emulate")
     ap.add_argument("--batch-size", type=int, default=8, help="batch cap B for static/continuous (none forces 1)")
     ap.add_argument("--config", default=None, help="label for this run (default = mode)")
@@ -575,7 +731,9 @@ async def main():
         if spec is not None:
             # Scenario-driven arrivals (multimodal + agent tool-loop)
             sub = []
-            if spec.burst_n > 0:
+            if spec.use_commute_script:
+                sub.append(commute_arrivals(disp, args, t0))
+            elif spec.burst_n > 0:
                 sub.append(burst_arrivals(disp, args, t0))
             else:
                 if spec.proactive_enabled:

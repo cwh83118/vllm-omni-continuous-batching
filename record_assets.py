@@ -28,7 +28,8 @@ PROACTIVE_DIR = ASSETS / "audio" / "proactive"
 INTERACTIVE_DIR = ASSETS / "audio" / "interactive"
 IMAGES_DIR = ASSETS / "images"
 
-VOICE = "zh-TW-HsiaoChenNeural"  # Mandarin TW female
+VOICE = "zh-TW-HsiaoChenNeural"  # Mandarin TW female — for mom's utterances
+VOICE_AI = "zh-TW-HsiaoYuNeural"  # alt voice — for AI assistant TTS (commute_run)
 RATE = "+10%"  # slightly faster so clips stay short
 
 PROACTIVE_AUDIO_SCRIPTS = [
@@ -74,24 +75,54 @@ def mp3_to_wav_16k_mono(mp3: Path, wav: Path) -> None:
     sf.write(str(wav), y, 16000, subtype="PCM_16")
 
 
-async def synth_one(text: str, out_wav: Path) -> None:
+async def synth_one(text: str, out_wav: Path, voice: str = VOICE) -> None:
     """Synthesize one clip with edge-tts and convert to 16k mono WAV."""
     mp3 = out_wav.with_suffix(".mp3")
-    communicate = edge_tts.Communicate(text, VOICE, rate=RATE)
+    communicate = edge_tts.Communicate(text, voice, rate=RATE)
     await communicate.save(str(mp3))
     mp3_to_wav_16k_mono(mp3, out_wav)
     mp3.unlink(missing_ok=True)
 
 
-async def synth_batch(scripts: list[str], out_dir: Path, prefix: str) -> None:
+async def synth_batch(scripts: list[str], out_dir: Path, prefix: str,
+                      voice: str = VOICE) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     for i, text in enumerate(scripts):
         wav = out_dir / f"{prefix}_{i:02d}.wav"
         if wav.exists():
             print(f"  skip {wav.name} (exists)")
             continue
+        if not text:
+            # agent events have no audio
+            continue
         print(f"  synth {wav.name} <- {text[:30]}...")
-        await synth_one(text, wav)
+        await synth_one(text, wav, voice=voice)
+
+
+async def synth_commute(out_dir_root: Path) -> None:
+    """Synthesize the 21-event commute_run scenario WAVs.
+
+    Output:
+      assets/audio/commute/inter_NN.wav  — mom's utterance (HsiaoChen voice)
+      assets/audio/commute/proa_NN.wav   — AI assistant TTS (HsiaoYu voice)
+      Agent events have no audio file.
+    """
+    from commute_script import COMMUTE_EVENTS
+    out_dir = out_dir_root / "audio" / "commute"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for ev in COMMUTE_EVENTS:
+        if not ev.audio_text:
+            continue
+        prefix = {"interactive": "inter", "proactive": "proa"}.get(ev.kind)
+        if not prefix:
+            continue
+        voice = VOICE if ev.kind == "interactive" else VOICE_AI
+        wav = out_dir / f"{prefix}_{ev.idx:02d}.wav"
+        if wav.exists():
+            print(f"  skip {wav.name} (exists)")
+            continue
+        print(f"  synth {wav.name} ({voice}) <- {ev.audio_text[:30]}...")
+        await synth_one(ev.audio_text, wav, voice=voice)
 
 
 def copy_images() -> None:
@@ -122,17 +153,20 @@ async def main() -> None:
     assert len(INTERACTIVE_AUDIO_SCRIPTS) == 10
     assert len(VEHICLE_STATUSES) == 8
 
-    print("[1/4] proactive WAVs ...")
+    print("[1/5] proactive WAVs ...")
     await synth_batch(PROACTIVE_AUDIO_SCRIPTS, PROACTIVE_DIR, "scene")
 
-    print("[2/4] interactive WAVs ...")
+    print("[2/5] interactive WAVs ...")
     await synth_batch(INTERACTIVE_AUDIO_SCRIPTS, INTERACTIVE_DIR, "task")
 
-    print("[3/4] images ...")
+    print("[3/5] images ...")
     copy_images()
 
-    print("[4/4] vehicle status ...")
+    print("[4/5] vehicle status ...")
     write_vehicle_status()
+
+    print("[5/5] commute_run WAVs (21-event mom scenario) ...")
+    await synth_commute(ASSETS)
 
     print("done.")
 

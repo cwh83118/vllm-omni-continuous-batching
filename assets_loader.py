@@ -53,6 +53,41 @@ def load_interactive_audio(idx: int) -> AudioClip:
     return AudioClip(path=p, b64=b64, duration_s=dur)
 
 
+def load_commute_audio(kind: str, event_idx: int) -> AudioClip:
+    """Load a WAV for the commute_run scenario.
+
+    kind ∈ {"interactive", "proactive"}; event_idx is the COMMUTE_EVENTS index.
+    """
+    prefix = {"interactive": "inter", "proactive": "proa"}[kind]
+    p = str(ASSETS / "audio" / "commute" / f"{prefix}_{event_idx:02d}.wav")
+    b64, dur = _read_wav_b64(p)
+    return AudioClip(path=p, b64=b64, duration_s=dur)
+
+
+def commute_content_blocks(kind: str, event_idx: int, with_image: bool = True) -> list[dict]:
+    """Content blocks for a commute_run event.
+
+    Proactive events: audio + optional image + brief context text.
+    Interactive events: audio + brief nudge text (no image — user's voice only).
+    """
+    audio = load_commute_audio(kind, event_idx)
+    blocks = []
+    if kind == "proactive" and with_image:
+        # rotate through the 8 combined images for variety
+        img = load_combined_image(event_idx % 8)
+        blocks.append({"type": "image_url",
+                       "image_url": {"url": f"data:image/jpeg;base64,{img}"}})
+    blocks.append({"type": "input_audio",
+                   "input_audio": {"data": audio.b64, "format": "wav"}})
+    if kind == "interactive":
+        blocks.append({"type": "text",
+                       "text": "請依語音指示一步步使用工具完成任務。"})
+    else:
+        blocks.append({"type": "text",
+                       "text": "這是即將要播報給駕駛的主動提醒，請簡短重述要點並輸出對應 JSON action。"})
+    return blocks
+
+
 def load_combined_image(idx: int) -> str:
     p = str(ASSETS / "images" / f"combined_{idx:04d}.jpg")
     return _read_jpg_b64(p)
