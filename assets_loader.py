@@ -64,6 +64,36 @@ def load_commute_audio(kind: str, event_idx: int) -> AudioClip:
     return AudioClip(path=p, b64=b64, duration_s=dur)
 
 
+def cabin_user_audio_path(scenario: str, speaker: str, event_idx: int) -> str:
+    """Realistic cabin: assets/audio/<base scenario>/<speaker>_NN.wav.
+
+    Both cabin_solo / cabin_solo_prod reuse the same audio (only sensor rate differs).
+    """
+    import realistic_cabin
+    base = realistic_cabin.audio_dir_name(scenario)
+    return str(ASSETS / "audio" / base / f"{speaker}_{event_idx:02d}.wav")
+
+
+def load_cabin_user_audio(scenario: str, speaker: str, event_idx: int) -> AudioClip:
+    p = cabin_user_audio_path(scenario, speaker, event_idx)
+    b64, dur = _read_wav_b64(p)
+    return AudioClip(path=p, b64=b64, duration_s=dur)
+
+
+def cabin_user_audio_duration(scenario: str, speaker: str, event_idx: int) -> float:
+    return load_cabin_user_audio(scenario, speaker, event_idx).duration_s
+
+
+def cabin_user_content_blocks(scenario: str, speaker: str, event_idx: int) -> list[dict]:
+    """Realistic cabin user utterance: audio + brief nudge text."""
+    audio = load_cabin_user_audio(scenario, speaker, event_idx)
+    return [
+        {"type": "input_audio", "input_audio": {"data": audio.b64, "format": "wav"}},
+        {"type": "text",
+         "text": f"（說話者：{speaker}）請依語音指示一步步使用工具完成任務。"},
+    ]
+
+
 def commute_content_blocks(kind: str, event_idx: int, with_image: bool = True) -> list[dict]:
     """Content blocks for a commute_run event.
 

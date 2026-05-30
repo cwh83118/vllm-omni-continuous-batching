@@ -42,6 +42,9 @@ class ScenarioSpec:
     burst_n: int = 0                 # if >0, run text-only single-turn burst (no proactive, no agent)
     burst_max_tokens: int = 180
     use_commute_script: bool = False  # if True, drive arrivals from commute_script.COMMUTE_EVENTS
+    use_realistic_cabin: str = ""     # "" or "cabin_solo" / "cabin_family"
+    per_stream_caps: dict = field(default_factory=dict)   # override Dispatcher PER_STREAM_CAP
+    total_in_flight_cap: int = 0      # 0 = use --batch-size
 
 
 SCENARIOS: dict[str, ScenarioSpec] = {
@@ -93,6 +96,38 @@ SCENARIOS: dict[str, ScenarioSpec] = {
         duration_s=200.0,                # 180 s script + 20 s drain
         proactive_enabled=False,         # actually driven by commute_script, this flag is ignored
         use_commute_script=True,
+    ),
+    "cabin_solo": ScenarioSpec(
+        name="cabin_solo",
+        duration_s=120.0,                # 120 s arrival; +drain after
+        proactive_enabled=False,
+        use_realistic_cabin="cabin_solo",
+        per_stream_caps={"interactive": 1, "agent": 3, "proactive": 4},
+        total_in_flight_cap=6,
+    ),
+    "cabin_family": ScenarioSpec(
+        name="cabin_family",
+        duration_s=120.0,
+        proactive_enabled=False,
+        use_realistic_cabin="cabin_family",
+        per_stream_caps={"interactive": 3, "agent": 3, "proactive": 4},
+        total_in_flight_cap=8,
+    ),
+    "cabin_solo_prod": ScenarioSpec(
+        name="cabin_solo_prod",
+        duration_s=120.0,
+        proactive_enabled=False,
+        use_realistic_cabin="cabin_solo_prod",
+        per_stream_caps={"interactive": 1, "agent": 3, "proactive": 4},
+        total_in_flight_cap=6,
+    ),
+    "cabin_family_prod": ScenarioSpec(
+        name="cabin_family_prod",
+        duration_s=120.0,
+        proactive_enabled=False,
+        use_realistic_cabin="cabin_family_prod",
+        per_stream_caps={"interactive": 3, "agent": 3, "proactive": 4},
+        total_in_flight_cap=8,
     ),
 }
 

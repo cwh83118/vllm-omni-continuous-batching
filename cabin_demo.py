@@ -199,15 +199,20 @@ class Dispatcher:
     """
 
     PRIORITY = {"interactive": 1, "agent": 2, "proactive": 3}
-    PER_STREAM_CAP = {"interactive": 1, "agent": 3, "proactive": 2}
+    DEFAULT_PER_STREAM_CAP = {"interactive": 1, "agent": 3, "proactive": 2}
 
-    def __init__(self, client, args, t0, log):
+    def __init__(self, client, args, t0, log,
+                 per_stream_cap: dict | None = None,
+                 total_cap_override: int = 0):
         self.client = client
         self.args = args
         self.t0 = t0
         self.log = log
         self.mode = args.mode                       # none | static | static_vip | continuous | continuous_pri
-        self.B = 1 if self.mode == "none" else max(1, args.batch_size)
+        # batch cap: scenario override > --batch-size
+        cap_from_args = 1 if self.mode == "none" else max(1, args.batch_size)
+        self.B = total_cap_override if total_cap_override > 0 and self.mode != "none" else cap_from_args
+        self.PER_STREAM_CAP = dict(per_stream_cap or self.DEFAULT_PER_STREAM_CAP)
         self.wave_mode = self.mode in ("none", "static", "static_vip")
         self.priority_aware = self.mode in ("static_vip", "continuous_pri")
         self.pending: list[Req] = []
@@ -453,6 +458,101 @@ def _next_agent_step_counter() -> int:
     v = _AGENT_STEP_COUNTER[0]
     _AGENT_STEP_COUNTER[0] += 1
     return v
+
+
+# === Realistic cabin AI: sustained sensor streams + multi-user utterances ====
+
+async def sensor_stream(disp: Dispatcher, args, t0, spec, brain_subtype: str,
+                        log_prefix: str):
+    """Fire one sustained sensor stream at given Hz.
+
+    spec is a realistic_cabin.SensorStreamSpec — has hz, has_image,
+    sys_prompt, prompt_templates, max_tokens.
+    """
+    import random
+    interval = 1.0 / spec.hz
+    rng = random.Random(args.seed * 100003 + hash(spec.name) & 0xFFFFFFFF)
+    i = 0
+    while time.monotonic() - t0 < args.duration:
+        # Build a brief content block: image (rotating) + short text prompt
+        blocks = []
+        n_image = 0
+        n_audio_sec = 0.0
+        if spec.has_image:
+            img_b64 = assets_loader.load_combined_image(i % 8)
+            blocks.append({"type": "image_url",
+                           "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}})
+            n_image = 1
+        text = spec.prompt_templates[i % len(spec.prompt_templates)]
+        blocks.append({"type": "text", "text": text})
+        req = Req(
+            rid=f"{spec.name}{i}", brain="proactive", idx=i, gidx=_next_gidx(),
+            sys_prompt=spec.sys_prompt, user_prompt=blocks,
+            brain_subtype=brain_subtype,
+            n_audio_sec=n_audio_sec, n_image=n_image,
+            event_idx=-1, priority=Dispatcher.PRIORITY["proactive"],
+            max_tokens=spec.max_tokens, temperature=0.2,
+        )
+        disp.submit(req)
+        i += 1
+        jitter = rng.uniform(-spec.period_jitter_s, spec.period_jitter_s)
+        await asyncio.sleep(max(0.05, interval + jitter))
+
+
+async def cabin_user_arrivals(disp: Dispatcher, args, t0, scenario_name: str):
+    """Fire user utterances per realistic_cabin SOLO/FAMILY schedule.
+
+    Each utterance triggers an agent tool-loop tagged with brain="interactive"
+    for step 0 (with audio) and "agent" for follow-ups (text-only).
+    """
+    import realistic_cabin
+    from agent_loop import run_agent_task
+
+    utterances = realistic_cabin.utterances_for(scenario_name)
+    inter_counter = [0]; step_counter = [0]
+
+    async def fire(ut):
+        target = ut.t
+        now = time.monotonic() - t0
+        if target > now:
+            await asyncio.sleep(target - now)
+        task_global_id = f"U{ut.idx}_{ut.speaker[:1]}"
+        i = inter_counter[0]; inter_counter[0] += 1
+
+        def step0_blocks():
+            return assets_loader.cabin_user_content_blocks(scenario_name, ut.speaker, ut.idx)
+
+        async def submit_step(*, step_idx, parent_rid, messages, max_tokens,
+                              temperature, gidx, audio_seconds):
+            rid = f"{task_global_id}_s{step_idx}"
+            if step_idx == 0:
+                audio_sec = assets_loader.cabin_user_audio_duration(scenario_name, ut.speaker, ut.idx)
+                brain_tag = "interactive"; pri = 1
+            else:
+                audio_sec = 0.0
+                brain_tag = "agent"; pri = 2
+            req = Req(rid=rid, brain=brain_tag, idx=step_counter[0],
+                      gidx=gidx,
+                      sys_prompt="", user_prompt="",
+                      brain_subtype=f"user_{ut.speaker}_step{step_idx}",
+                      parent_rid=task_global_id, step_idx=step_idx,
+                      n_audio_sec=audio_sec, n_image=0,
+                      full_messages=messages,
+                      event_idx=ut.idx, priority=pri,
+                      max_tokens=max_tokens, temperature=temperature)
+            step_counter[0] += 1
+            return await disp.submit_and_await(req)
+
+        await run_agent_task(
+            submit_step=submit_step,
+            task_idx=ut.idx,
+            task_global_id=task_global_id,
+            audio_blocks_step0=step0_blocks,
+            next_gidx=_next_gidx,
+            log=disp.log,
+        )
+
+    await asyncio.gather(*[fire(ut) for ut in utterances])
 
 
 # === commute_run: the 180s mom-pickup scenario =============================
@@ -725,13 +825,29 @@ async def main():
     _GIDX[0] = 0
     _AGENT_STEP_COUNTER[0] = 0
     t0 = time.monotonic()
-    disp = Dispatcher(client, args, t0, log)
+    # Scenario may override per-stream caps + total in-flight cap (realistic_cabin)
+    per_stream_cap = None
+    total_cap = 0
+    if spec is not None:
+        per_stream_cap = spec.per_stream_caps or None
+        total_cap = spec.total_in_flight_cap
+    disp = Dispatcher(client, args, t0, log,
+                      per_stream_cap=per_stream_cap,
+                      total_cap_override=total_cap)
 
     async def arrivals():
         if spec is not None:
             # Scenario-driven arrivals (multimodal + agent tool-loop)
             sub = []
-            if spec.use_commute_script:
+            if spec.use_realistic_cabin:
+                import realistic_cabin
+                streams = realistic_cabin.streams_for(spec.use_realistic_cabin)
+                for stream_spec in streams:
+                    sub.append(sensor_stream(disp, args, t0, stream_spec,
+                                             brain_subtype=stream_spec.subtype,
+                                             log_prefix=stream_spec.name))
+                sub.append(cabin_user_arrivals(disp, args, t0, spec.use_realistic_cabin))
+            elif spec.use_commute_script:
                 sub.append(commute_arrivals(disp, args, t0))
             elif spec.burst_n > 0:
                 sub.append(burst_arrivals(disp, args, t0))

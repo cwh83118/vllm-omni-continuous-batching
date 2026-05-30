@@ -12,11 +12,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 RUNS = [
-    ("R2_throttle_none",          "none\n(serial B=1)",          "#b71c1c"),
-    ("R3_throttle_static",        "static\n(B=6, wave drain)",   "#ef6c00"),
-    ("R4_throttle_static_vip",    "static + VIP\n(B=6)",         "#7b1fa2"),
-    ("R5_throttle_continuous",    "continuous\n(B=6 FIFO)",      "#2e7d32"),
-    ("R6_throttle_continuous_pri","continuous + pri\n(B=6)",     "#00695c"),
+    ("R2_throttle_none",          "none",          "#b71c1c"),
+    ("R3_throttle_static",        "static",        "#ef6c00"),
+    ("R4_throttle_static_vip",    "static+VIP",    "#7b1fa2"),
+    ("R5_throttle_continuous",    "continuous",    "#2e7d32"),
+    ("R6_throttle_continuous_pri","cont+pri",      "#00695c"),
 ]
 
 # Tracks: TTFT p50 / p95 / max — for interactive stream (the user latency)
@@ -37,7 +37,7 @@ def load_summaries():
 
 def main():
     data = load_summaries()
-    fig, axes = plt.subplots(1, 3, figsize=(14, 5))
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5.5))
 
     labels = [r[1] for r in RUNS]
     colors = [r[2] for r in RUNS]
@@ -49,22 +49,24 @@ def main():
             vals_ms.append(0 if v is None or v != v else v * 1000)
         bars = ax.bar(range(len(labels)), vals_ms, color=colors, alpha=0.92, edgecolor="#222", linewidth=0.6)
         ax.set_xticks(range(len(labels)))
-        ax.set_xticklabels(labels, fontsize=8.5)
+        ax.set_xticklabels(labels, fontsize=10, rotation=0)
         ax.set_title(title, fontsize=11)
-        ax.set_ylabel("ms")
+        ax.set_ylabel("ms", fontsize=10)
         ax.grid(axis="y", alpha=0.3)
-        # value labels above bars
+        ymax = max(vals_ms) if vals_ms else 1
         for bar, v in zip(bars, vals_ms):
-            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(vals_ms)*0.02,
-                    f"{v:.0f}", ha="center", va="bottom", fontsize=9, fontweight="bold")
-        ax.set_ylim(0, max(vals_ms) * 1.18 if max(vals_ms) > 0 else 1)
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + ymax*0.025,
+                    f"{v:.0f}", ha="center", va="bottom", fontsize=10, fontweight="bold")
+        ax.set_ylim(0, ymax * 1.22 if ymax > 0 else 1)
+        # margins so labels don't touch axes
+        ax.margins(x=0.05)
 
-    fig.suptitle("Interactive TTFT on CX1-throttled 5090 — 5 batching modes × commute_run scenario\n"
-                 "(throttled BW ≈ 68 GB/s, decode ≈ 24 tok/s; conservative bound — real CX1 @ 154 GB/s would be ~2.3× faster)",
+    fig.suptitle("Interactive TTFT × 5 batching modes — commute_run on CX1-throttled 5090 (BW≈68 GB/s)\n"
+                 "All modes at total in-flight cap B=6; same seed = same arrival sequence; only the scheduler differs.",
                  fontsize=11, y=0.995)
-    fig.tight_layout(rect=[0, 0, 1, 0.92])
+    fig.tight_layout(rect=[0, 0, 1, 0.91])
     out = "results/commute_ttft_bars.png"
-    fig.savefig(out, dpi=130, bbox_inches="tight")
+    fig.savefig(out, dpi=140, bbox_inches="tight")
     print(f"wrote {out}")
 
     # also print the table

@@ -16,6 +16,12 @@
 > 比較 **none / static / static + VIP / continuous / continuous + priority** 5 種排程方式。
 > **頭條結論：TTFT p50 看不出差別 (~110 ms 一致)，但 TTFT p95 是 1952 ms (static) vs 189 ms (continuous) — 10× 差距**。
 > 對老闆問題「投資 continuous batching 帶來怎樣的體感效益」的直接量化答案：**5% 的時刻從「等 2 秒」變「200 ms 即時」**。
+>
+> 🚙 **Production cabin AI 真實負載版（4 sensor stream + multi-turn 對話 + 單駕駛/家庭雙情境 × 5 mode）：[`REPORT_REALISTIC.md`](REPORT_REALISTIC.md)**
+> 把 production cabin AI 必備的持續性感知 stream（DMS、Scene VLM、Cabin、App）+ multi-turn user 對話加進來，
+> 跑 **4 scenarios × 5 modes = 20 runs, 0 errors**。
+> **頭條結論：TTFT p50 在 production load 下 continuous (245 ms) vs static (1534 ms) = 6.3× 倍速**，
+> none (235 秒) 完全不能用。**v3 直接量化老闆問題：「在 production cabin AI 的 typical case，continuous 把體感從『等 1.5 秒』壓到『真正即時』」。**
 
 ---
 

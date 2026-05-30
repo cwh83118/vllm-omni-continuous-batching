@@ -99,6 +99,36 @@ async def synth_batch(scripts: list[str], out_dir: Path, prefix: str,
         await synth_one(text, wav, voice=voice)
 
 
+CABIN_VOICES = {
+    "driver":    ("zh-TW-HsiaoChenNeural", "+10%"),    # mom
+    "co_driver": ("zh-TW-HsiaoYuNeural", "+5%"),       # dad (HsiaoYu also female-ish; voice variety only)
+    "child":     ("zh-CN-XiaoyiNeural", "+20%"),       # kid
+}
+
+
+async def synth_cabin_scenario(scenario_name: str, out_dir_root: Path) -> None:
+    """Synthesize WAVs for cabin_solo / cabin_family.
+
+    Output: assets/audio/<scenario>/<speaker>_NN.wav
+    """
+    import realistic_cabin
+    out_dir = out_dir_root / "audio" / scenario_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    utterances = realistic_cabin.utterances_for(scenario_name)
+    for ut in utterances:
+        voice, rate = CABIN_VOICES.get(ut.speaker, (VOICE, RATE))
+        wav = out_dir / f"{ut.speaker}_{ut.idx:02d}.wav"
+        if wav.exists():
+            print(f"  skip {wav.name} (exists)")
+            continue
+        print(f"  synth {wav.name} ({voice}) <- {ut.text[:30]}...")
+        mp3 = wav.with_suffix(".mp3")
+        communicate = edge_tts.Communicate(ut.text, voice, rate=rate)
+        await communicate.save(str(mp3))
+        mp3_to_wav_16k_mono(mp3, wav)
+        mp3.unlink(missing_ok=True)
+
+
 async def synth_commute(out_dir_root: Path) -> None:
     """Synthesize the 21-event commute_run scenario WAVs.
 
@@ -165,8 +195,14 @@ async def main() -> None:
     print("[4/5] vehicle status ...")
     write_vehicle_status()
 
-    print("[5/5] commute_run WAVs (21-event mom scenario) ...")
+    print("[5/7] commute_run WAVs (21-event mom scenario) ...")
     await synth_commute(ASSETS)
+
+    print("[6/7] cabin_solo WAVs ...")
+    await synth_cabin_scenario("cabin_solo", ASSETS)
+
+    print("[7/7] cabin_family WAVs (3 speakers) ...")
+    await synth_cabin_scenario("cabin_family", ASSETS)
 
     print("done.")
 
