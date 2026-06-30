@@ -4,27 +4,28 @@
 座艙 AI 多步驟 Agentic 任務 — TPS 需求趨勢分析
 =================================================
 
-情境
+任務
 ----
-- 3 步驟任務 = 連續呼叫 3 次工具, 最後合成第一個自然語音回覆 (TTS 第一個 chunk)
-- 端到端 deadline = 3.5 秒 (從收到輸入 -> 算完所有事 -> 產出第一個語音回覆所需的 token)
-- Agentic: 每一步的 output 會 concat 到 context, 成為下一步 input 的尾段
-- 比較兩種服務方式:
-    * 序列 (Sequential)        : N 個任務一個一個做
-    * 併發 (Concurrent, N 路)  : N 個任務同時做 (Decode 可 batch, Prefill 不行)
+- 一個任務會呼叫 N 次工具 (本題 N=3), 每次工具 decode 30 tokens, 最後再 decode 一段
+  自然語言回覆 (TTS 第一個 chunk)。
+- 端到端 deadline = 3.5 秒 (收到輸入 -> 全部算完 -> 產出第一個語音回覆的 token)。
+- Agentic: 每一步 output 會 concat 到 context, 成為下一步 input 的尾段。
+
+★ 序列 vs 併發 (指任務裡那 N 次「工具的 decode」) ★
+----------------------------------------------------
+- 序列 (Sequential): N 個工具一個接一個 decode -> 牆鐘要吐 N x 30 tokens。
+- 併發 (Batch)    : N 個工具丟進同一個 batch 一起 decode -> 一輪同時吐 N 條的 token,
+                    所以牆鐘只花「30 tokens」的時間 (與 N 無關!)。
+  (前提: 這 N 個工具彼此獨立、可平行呼叫; 若嚴格 agentic 互相依賴就只能走序列。)
+
+最後那段自然語言回覆是「一條」單獨生成 (無法平行), 兩種模式都要付 1 次。
 
 SoC 性能 (輸入條件)
 -------------------
-- Prefill TPS: 一次 prefill 的 token 數 <= 1000 -> 4000 tok/s ; > 1000 -> 6000 tok/s
+- Prefill TPS: 單次 prefill token <= 1000 -> 4000 tok/s ; > 1000 -> 6000 tok/s
 - ViT: 單張 480x320 影像 = 20 ms (不可 batch)
-- Decode TPS: 未給 -> 這正是我們要 "反推" 的需求值
-
-關鍵物理事實 (用於併發推導)
----------------------------
-- Prefill 目前無法 batch  -> N 路的 prefill 與 ViT 會被「序列化」, 時間 = N x 單路
-- Decode 可以 batch        -> 一個 batch step 同時替 N 條序列各吐 1 個 token,
-                              權重只從記憶體讀一次 -> 聚合吞吐 (aggregate TPS) ~ 隨 N 近線性成長
-                              直到 compute-bound 撞到 roofline 才飽和
+- Decode TPS: 未給 -> 這正是我們要「反推」的需求值
+- Prefill / ViT 不可 batch; Decode 可 batch。
 """
 
 import numpy as np
@@ -38,9 +39,9 @@ import matplotlib.pyplot as plt
 # ============================================================
 
 # --- 任務結構 ---
-N_TOOL_STEPS          = 3      # 呼叫工具次數 (步驟數)
-DECODE_TOK_PER_STEP   = 30     # 每一步 (每次工具呼叫) 模型 decode 出的 token 數
-FINAL_REPLY_TOK       = 30     # 最後自然語言回覆 "第一個語音 chunk" 需要的 token 數 (一句話 ~ 30 tok)
+N_TOOL_STEPS          = 3      # 本題工具呼叫次數 (= 圖上標出的實際任務點)
+DECODE_TOK_PER_STEP   = 30     # 每次工具 decode 出的 token 數
+FINAL_REPLY_TOK       = 30     # 最後自然語言回覆「第一個語音 chunk」的 token 數 (一句 ~30 tok)
 
 # --- 輸入 ---
 N_TEXT_TOKENS         = 400    # System Prompt 文字 token
@@ -48,9 +49,9 @@ N_IMAGES              = 6      # 圖片張數
 IMG_W, IMG_H          = 480, 320
 
 # --- SoC: Prefill ---
-PREFILL_TPS_SMALL     = 4000   # 單次 prefill token <= 門檻時的 TPS
-PREFILL_TPS_LARGE     = 6000   # 單次 prefill token >  門檻時的 TPS
-PREFILL_SIZE_THRESH   = 1000   # 門檻 (tokens)
+PREFILL_TPS_SMALL     = 4000
+PREFILL_TPS_LARGE     = 6000
+PREFILL_SIZE_THRESH   = 1000
 
 # --- SoC: ViT ---
 VIT_MS_PER_UNIT_IMG   = 20.0   # 每張「480x320 倍率=1」影像的 ViT 時間 (ms)
@@ -59,13 +60,11 @@ UNIT_IMG_PIXELS       = 480 * 320
 # --- 任務 deadline ---
 DEADLINE_S            = 3.5
 
-# --- 是否假設 KV-cache / prefix caching (步驟間只 prefill 新增的尾段) ---
+# --- KV-cache / prefix caching: 步驟間只 prefill 新增尾段 ---
 USE_KV_CACHE          = True
 
-# --- (僅供圖上對照) 假想 SoC 的 decode 能力, 你可填真實量測值 ---
-#  single-stream decode TPS, 以及 batch 後聚合吞吐的 roofline 上限
-SOC_DECODE_TPS_SINGLE = 50.0    # 單路 decode 速度 (tok/s)  <-- 換成你 SoC 實測
-SOC_DECODE_TPS_ROOF   = 1200.0  # batch 後聚合 decode 吞吐上限 (tok/s) <-- 換成你 SoC 實測
+# --- (供圖上對照) 假想 SoC 單路 decode 速度, 換成你 SoC 實測 ---
+SOC_DECODE_TPS_SINGLE = 50.0   # tok/s  <-- 你的 SoC 單流 decode
 
 
 # ============================================================
@@ -74,10 +73,8 @@ SOC_DECODE_TPS_ROOF   = 1200.0  # batch 後聚合 decode 吞吐上限 (tok/s) <-
 def qwen_vision_tokens(w, h, patch=14, merge=2,
                        min_pixels=4 * 28 * 28, max_pixels=16384 * 28 * 28):
     """
-    Qwen2-VL / Qwen2.5-VL 的 vision token 計算方式。
-    - factor = patch * merge = 28, 影像長寬各 round 到 28 的倍數 (smart_resize)
-    - patch 數 = (H/14) * (W/14)
-    - 2x2 spatial merge -> token 數 = patch 數 / 4
+    Qwen2-VL / Qwen2.5-VL: factor = patch*merge = 28, 長寬各 round 到 28 倍數,
+    patch 數 = (H/14)*(W/14), 2x2 merge -> token = patch/4。
     """
     factor = patch * merge  # 28
 
@@ -86,8 +83,6 @@ def qwen_vision_tokens(w, h, patch=14, merge=2,
 
     h_bar = round_by_factor(h, factor)
     w_bar = round_by_factor(w, factor)
-
-    # (本題影像很小, min/max pixels 不會觸發, 保留完整邏輯)
     if h_bar * w_bar > max_pixels:
         beta = (h * w / max_pixels) ** 0.5
         h_bar = int(np.floor(h / beta / factor) * factor)
@@ -97,11 +92,9 @@ def qwen_vision_tokens(w, h, patch=14, merge=2,
         h_bar = int(np.ceil(h * beta / factor) * factor)
         w_bar = int(np.ceil(w * beta / factor) * factor)
 
-    grid_h = h_bar // patch
-    grid_w = w_bar // patch
+    grid_h, grid_w = h_bar // patch, w_bar // patch
     n_patches = grid_h * grid_w
-    n_tokens = n_patches // (merge * merge)
-    return n_tokens, (w_bar, h_bar), (grid_w, grid_h), n_patches
+    return n_patches // (merge * merge), (w_bar, h_bar), (grid_w, grid_h), n_patches
 
 
 # ============================================================
@@ -115,203 +108,204 @@ def prefill_time_s(n_tokens):
 
 
 # ============================================================
-# 4) 單路 (single path) 成本拆解
+# 4) 固定成本 (ViT + Prefill) — 序列 / 併發都一樣 (輸入相同)
 # ============================================================
-def single_path_costs(verbose=True):
-    # --- vision tokens ---
+def fixed_costs(N, verbose=False):
+    """回傳 ViT 時間、prefill 時間、固定成本 F (秒), 及 vision tokens 等資訊。"""
     vtok_per_img, dims, grid, npatch = qwen_vision_tokens(IMG_W, IMG_H)
     vision_tokens = vtok_per_img * N_IMAGES
 
-    # --- ViT 時間: 每張影像相對 480x320 的倍率 x 20ms ---
-    ratio = (IMG_W * IMG_H) / UNIT_IMG_PIXELS          # 本題=1.0
+    ratio = (IMG_W * IMG_H) / UNIT_IMG_PIXELS
     vit_s = N_IMAGES * ratio * VIT_MS_PER_UNIT_IMG / 1000.0
 
-    # --- 初始輸入 token = 文字 + vision ---
     initial_input = N_TEXT_TOKENS + vision_tokens
 
-    # --- prefill 時間 (含 agentic 各步) ---
-    prefill_phases = []
+    # prefill: 初始輸入 prefill 一次 (N 個工具共用同一段 context);
+    # 加上 N 次工具 output 累積進 context 的尾段 (N x 30 tokens)。
     if USE_KV_CACHE:
-        # 步驟間只需 prefill 新增的尾段 (前一步 output / 工具結果)
-        prefill_phases.append(("initial", initial_input, prefill_time_s(initial_input)))
-        for i in range(N_TOOL_STEPS):
-            tail = DECODE_TOK_PER_STEP   # 上一步 output concat 進來的尾段
-            prefill_phases.append((f"tail_step{i+1}", tail, prefill_time_s(tail)))
+        tail_tokens = N * DECODE_TOK_PER_STEP
+        prefill_s = prefill_time_s(initial_input) + prefill_time_s(tail_tokens)
     else:
-        # 無 KV-cache: 每一步把累積 context 整段重 prefill
-        ctx = initial_input
-        prefill_phases.append(("step1_full", ctx, prefill_time_s(ctx)))
-        for i in range(N_TOOL_STEPS):
+        # 無 KV-cache: 每步重 prefill 全文
+        prefill_s, ctx = 0.0, initial_input
+        prefill_s += prefill_time_s(ctx)
+        for _ in range(N):
             ctx += DECODE_TOK_PER_STEP
-            prefill_phases.append((f"step{i+2}_full", ctx, prefill_time_s(ctx)))
+            prefill_s += prefill_time_s(ctx)
 
-    prefill_s = sum(p[2] for p in prefill_phases)
-
-    # --- decode token 總數: 3 次工具呼叫 + 最後回覆第一個 chunk ---
-    decode_tokens = N_TOOL_STEPS * DECODE_TOK_PER_STEP + FINAL_REPLY_TOK
-
-    # 單路「非 decode」固定成本 (序列化的部分): prefill + ViT
-    fixed_s = prefill_s + vit_s
-
+    F = vit_s + prefill_s
+    info = dict(vision_tokens=vision_tokens, initial_input=initial_input,
+                vit_s=vit_s, prefill_s=prefill_s, F=F,
+                vtok_per_img=vtok_per_img, dims=dims, grid=grid, npatch=npatch)
     if verbose:
         print("=" * 64)
-        print("單路成本拆解 (single path)")
+        print(f"固定成本拆解 (N={N} 工具)")
         print("=" * 64)
-        print(f"Qwen ViT: 每張 480x320 -> resize {dims[0]}x{dims[1]}, "
-              f"grid {grid[0]}x{grid[1]} = {npatch} patches -> {vtok_per_img} tokens")
-        print(f"Vision tokens : {vtok_per_img} x {N_IMAGES} 張 = {vision_tokens}")
-        print(f"Text tokens   : {N_TEXT_TOKENS}")
-        print(f"初始 Input    : {initial_input} tokens")
-        print(f"ViT 時間      : {N_IMAGES} 張 x {VIT_MS_PER_UNIT_IMG:.0f}ms = {vit_s*1000:.1f} ms")
-        print(f"KV-cache      : {'ON (步驟間只 prefill 尾段)' if USE_KV_CACHE else 'OFF (每步重 prefill 全文)'}")
-        print("-- prefill 各階段 --")
-        for name, ntok, t in prefill_phases:
-            tps = PREFILL_TPS_SMALL if ntok <= PREFILL_SIZE_THRESH else PREFILL_TPS_LARGE
-            print(f"   {name:<14} {ntok:>5} tok @ {tps} tps = {t*1000:7.2f} ms")
-        print(f"Prefill 總時間: {prefill_s*1000:.1f} ms")
-        print(f"固定成本 F    : prefill+ViT = {fixed_s*1000:.1f} ms")
-        print(f"Decode tokens : {N_TOOL_STEPS}x{DECODE_TOK_PER_STEP} + {FINAL_REPLY_TOK} "
-              f"= {decode_tokens} tokens")
+        print(f"Qwen ViT: 480x320 -> resize {dims[0]}x{dims[1]}, grid {grid[0]}x{grid[1]} "
+              f"= {npatch} patches -> {vtok_per_img} tok/張")
+        print(f"Vision tokens : {vtok_per_img} x {N_IMAGES} = {vision_tokens}")
+        print(f"初始 Input    : {N_TEXT_TOKENS} text + {vision_tokens} vision = {initial_input} tok")
+        print(f"ViT 時間      : {N_IMAGES} x {VIT_MS_PER_UNIT_IMG:.0f}ms = {vit_s*1000:.1f} ms")
+        print(f"Prefill 時間  : {prefill_s*1000:.1f} ms  (初始 {prefill_time_s(initial_input)*1000:.1f} "
+              f"+ 尾段 {N}x30)")
+        print(f"固定成本 F    : ViT+Prefill = {F*1000:.1f} ms")
+        print(f"decode 預算   : {DEADLINE_S}s - F = {(DEADLINE_S-F)*1000:.1f} ms")
         print()
-
-    return dict(vision_tokens=vision_tokens, initial_input=initial_input,
-                vit_s=vit_s, prefill_s=prefill_s, fixed_s=fixed_s,
-                decode_tokens=decode_tokens)
+    return info
 
 
 # ============================================================
-# 5) TPS 需求公式  (★同一個 3.5s total, N 路全部要做完★)
+# 5) Decode 需求 — 序列 vs 併發 batch
 # ============================================================
 #
-# 令 F = 單路 (prefill + ViT) 序列化固定成本, D = 單路 decode token 數, T = deadline(3.5s)
+# decode 預算時間: budget = T - F
 #
-# 兩種模式「都」要在同一個 T 內把 N 路全部做完。
-# Prefill / ViT 都不能 batch -> 兩種模式的序列化固定成本都是 N x F。
-# 留給 decode 的時間都是 (T - N x F); 要 decode 的總量都是 N x D。
-# 可行條件 (兩者共用): N x F < T  -> 硬上限 N_max = floor(T / F)
+# 牆鐘要 decode 的 token 數 (這是 序列/併發 唯一的差別):
+#   序列 Sequential : N 個工具逐一 decode  = N x 30  ; 再加最後回覆 30  -> N*30 + 30
+#   併發 Batch      : N 個工具一輪同時 decode = 30    ; 再加最後回覆 30  ->   30 + 30
 #
-# 【序列 Sequential】 一條 stream 把 N x D 個 token 逐一吐完:
-#       需求「單流」decode TPS = (N x D) / (T - N x F)        <-- 必須由"一條"stream 達成
+# 需求 (單流) decode TPS = 牆鐘 decode token / budget
+#   序列: (N*30 + 30) / budget   -> 隨 N 線性上升
+#   併發: (  30 + 30) / budget   -> 與 N 無關 (近水平)
+#   工具階段差異倍率 = N   (N*30 vs 30)
 #
-# 【併發 Batch (N 路)】 N 條 stream 一起 decode (每個 step 同時吐 N 個 token):
-#       decode 牆鐘 = D / 每流TPS  (與 N 無關!)
-#       需求「每流」decode TPS  = D / (T - N x F)             <-- 每條只要這麼快
-#       需求「聚合」decode TPS  = (N x D) / (T - N x F)       <-- 與序列的單流需求同值
-#
-# ★ TPS 差異: 聚合需求相同, 但序列要"一條"stream 扛, batch 拆給 N 條 ->
-#   每流門檻低 N 倍。這就是 batch 的優勢 (= 倍率 N)。
-#
-def seq_required_tps(N, D, F, T=DEADLINE_S):
-    """序列: 單一條 stream 要吐完 N x D 個 token 的需求 TPS。"""
-    denom = T - N * F
-    return np.where(denom > 0, (N * D) / denom, np.inf)
+def seq_decode_tokens(N):
+    return N * DECODE_TOK_PER_STEP + FINAL_REPLY_TOK
 
-def batch_required_perstream_tps(N, D, F, T=DEADLINE_S):
-    """併發 batch: 每一條 stream 的需求 TPS。"""
-    denom = T - N * F
-    return np.where(denom > 0, D / denom, np.inf)
+def batch_decode_tokens(N):
+    return DECODE_TOK_PER_STEP + FINAL_REPLY_TOK
 
-def batch_required_aggregate_tps(N, D, F, T=DEADLINE_S):
-    """併發 batch: 聚合需求 TPS (= 序列的單流需求同值)。"""
-    denom = T - N * F
-    return np.where(denom > 0, (N * D) / denom, np.inf)
-
-def soc_aggregate_capability(N):
-    """SoC batch 後可達到的聚合 decode 吞吐: 近線性成長到 roofline 飽和。"""
-    return np.minimum(N * SOC_DECODE_TPS_SINGLE, SOC_DECODE_TPS_ROOF)
+def required_tps(decode_tokens, F, T=DEADLINE_S):
+    denom = T - F
+    return np.inf if denom <= 0 else decode_tokens / denom
 
 
 # ============================================================
-# 6) 主程式: 計算 + 印表 + 畫圖
+# 6) 主程式
 # ============================================================
 def main():
-    c = single_path_costs(verbose=True)
-    D, F = c["decode_tokens"], c["fixed_s"]
     T = DEADLINE_S
+    fixed_costs(N_TOOL_STEPS, verbose=True)
 
-    N_max = int(np.floor(T / F))   # prefill 序列化的硬上限 (兩模式共用)
-
-    print("=" * 72)
-    print("結果  (同一個 3.5s total, N 路全部要做完)")
-    print("=" * 72)
-    print(f"硬上限 N_max = floor({T}/{F:.3f}) = {N_max} 路  "
-          f"(N>{N_max} 時光 prefill+ViT 就 > {T}s, 兩種模式都不可行)")
+    print("=" * 78)
+    print("序列 vs 併發 batch 的 decode TPS 需求 (deadline 3.5s)")
+    print("=" * 78)
+    print(f"{'N工具':>5} | {'F(ViT+prefill)':>13} | {'budget':>8} | "
+          f"{'序列decode':>9} {'需求TPS':>8} | {'併發decode':>9} {'需求TPS':>8} | {'倍率':>4}")
+    print("-" * 88)
+    rows = []
+    for N in range(1, 9):
+        info = fixed_costs(N)
+        F = info["F"]
+        budget = T - F
+        sd, bd = seq_decode_tokens(N), batch_decode_tokens(N)
+        stps = required_tps(sd, F)
+        btps = required_tps(bd, F)
+        rows.append((N, F, budget, sd, bd, stps, btps))
+        mark = "  <- 本題" if N == N_TOOL_STEPS else ""
+        if budget <= 0:
+            print(f"{N:>5} | {F*1000:>10.0f} ms | {'<=0':>8} | {sd:>9} {'INF':>8} | "
+                  f"{bd:>9} {'INF':>8} | {'-':>4}{mark}")
+        else:
+            print(f"{N:>5} | {F*1000:>10.0f} ms | {budget*1000:>5.0f} ms | "
+                  f"{sd:>6} tok {stps:>6.0f} | {bd:>6} tok {btps:>6.0f} | "
+                  f"{sd/bd:>3.1f}x{mark}")
     print()
-    print(f"{'N':>3} | {'decode預算':>9} | {'序列單流需求':>11} | {'batch每流需求':>12} | "
-          f"{'聚合(=序列)':>10} | {'差異倍率':>7}")
-    print("-" * 72)
-    for N in range(1, N_max + 3):
-        denom = T - N * F
-        if denom <= 0:
-            print(f"{N:>3} | {'<=0':>9} | {'INF':>11} | {'INF':>12} | {'INF':>10} | {N:>6}x")
-            continue
-        seq = (N * D) / denom          # 序列: 單流需求
-        per = D / denom                # batch: 每流需求
-        agg = (N * D) / denom          # batch: 聚合需求 (= 序列單流需求)
-        print(f"{N:>3} | {denom*1000:>6.0f} ms | {seq:>9.0f} t/s | {per:>10.0f} t/s | "
-              f"{agg:>8.0f} t/s | {N:>6}x")
-    print()
-    print("解讀: 聚合需求兩者相同; 序列要『一條 stream』扛下整個聚合 (極難),")
-    print("      batch 拆成 N 條 -> 每流門檻低 N 倍, 這就是 batch 的 TPS 優勢。")
+
+    # 針對本題 N=3 的結論
+    info3 = fixed_costs(N_TOOL_STEPS)
+    F3 = info3["F"]
+    b3 = T - F3
+    s3 = required_tps(seq_decode_tokens(N_TOOL_STEPS), F3)
+    bt3 = required_tps(batch_decode_tokens(N_TOOL_STEPS), F3)
+    print(f"[本題 N={N_TOOL_STEPS}]  budget = {b3*1000:.0f} ms")
+    print(f"  序列: decode {seq_decode_tokens(N_TOOL_STEPS)} tok -> 需求 {s3:.1f} tok/s")
+    print(f"  併發: decode {batch_decode_tokens(N_TOOL_STEPS)} tok -> 需求 {bt3:.1f} tok/s")
+    print(f"  SoC 單流 {SOC_DECODE_TPS_SINGLE:.0f} tok/s -> "
+          f"序列 {'OK' if SOC_DECODE_TPS_SINGLE>=s3 else 'FAIL'} / "
+          f"併發 {'OK' if SOC_DECODE_TPS_SINGLE>=bt3 else 'FAIL'}")
     print()
 
-    # -------- 畫圖 --------
-    Ns = np.arange(1, max(N_max + 2, 10) + 1)
-    seq_req   = seq_required_tps(Ns, D, F, T)                 # 序列: 單流需求 (= 聚合)
-    batch_per = batch_required_perstream_tps(Ns, D, F, T)     # batch: 每流需求
-    cap_agg   = soc_aggregate_capability(Ns)
-
-    seq_plot   = np.where(np.isfinite(seq_req), seq_req, np.nan)
-    batch_plot = np.where(np.isfinite(batch_per), batch_per, np.nan)
+    # ================= 畫圖 =================
+    Ns = np.arange(1, 9)
+    seq_tps = np.array([required_tps(seq_decode_tokens(n), fixed_costs(n)["F"]) for n in Ns])
+    bat_tps = np.array([required_tps(batch_decode_tokens(n), fixed_costs(n)["F"]) for n in Ns])
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
 
-    # 左圖: ★TPS 差異★ — 序列(單流) vs batch(每流) 的需求 decode TPS
-    ax1.plot(Ns, seq_plot, "o-", color="#d62728", lw=2.4,
-             label="SEQUENTIAL: required single-stream TPS = N*D/(T-N*F)")
-    ax1.plot(Ns, batch_plot, "o-", color="#9467bd", lw=2.4,
-             label="BATCH: required per-stream TPS = D/(T-N*F)")
+    # ---- 左圖: 需求 decode TPS vs 工具數 N ----
+    ax1.plot(Ns, seq_tps, "o-", color="#d62728", lw=2.4,
+             label="SEQUENTIAL: (N*30 + 30) / budget")
+    ax1.plot(Ns, bat_tps, "o-", color="#2ca02c", lw=2.4,
+             label="BATCH (parallel tools): (30 + 30) / budget")
     ax1.axhline(SOC_DECODE_TPS_SINGLE, color="#ff7f0e", lw=2, ls="--",
                 label=f"SoC single-stream decode = {SOC_DECODE_TPS_SINGLE:.0f}")
-    ax1.axvline(N_max + 0.5, color="gray", lw=1.5, ls="--")
-    ax1.text(N_max + 0.55, SOC_DECODE_TPS_SINGLE,
-             f"  Prefill hard limit\n  N_max = {N_max}", color="gray", va="bottom", fontsize=10)
-    # 標出幾個點的 N 倍差距
-    for n in [2, 4, 6, 8]:
-        if T - n * F > 0:
-            ax1.annotate(f"{n}x", xy=(n, (n*D)/(T-n*F)), xytext=(n-0.15, (n*D)/(T-n*F)*1.15),
-                         color="#d62728", fontsize=9, fontweight="bold")
-    ax1.set_xlabel("N  (paths to finish within the SAME 3.5s)", fontsize=12)
-    ax1.set_ylabel("Required decode TPS per stream (tokens/s)", fontsize=12)
-    ax1.set_title("TPS DIFFERENCE: Sequential vs Batch\n(per-stream requirement; gap = N x)",
+    ax1.axvline(N_TOOL_STEPS, color="gray", lw=1.3, ls=":")
+    ax1.text(N_TOOL_STEPS + 0.07, ax1.get_ylim()[0] if False else 12,
+             f"this task\nN={N_TOOL_STEPS}", color="gray", fontsize=9)
+    # 標 N=3 的兩點數值
+    ax1.annotate(f"{seq_tps[N_TOOL_STEPS-1]:.0f}", xy=(N_TOOL_STEPS, seq_tps[N_TOOL_STEPS-1]),
+                 xytext=(N_TOOL_STEPS+0.12, seq_tps[N_TOOL_STEPS-1]*1.06),
+                 color="#d62728", fontsize=10, fontweight="bold")
+    ax1.annotate(f"{bat_tps[N_TOOL_STEPS-1]:.0f}", xy=(N_TOOL_STEPS, bat_tps[N_TOOL_STEPS-1]),
+                 xytext=(N_TOOL_STEPS+0.12, bat_tps[N_TOOL_STEPS-1]*0.80),
+                 color="#2ca02c", fontsize=10, fontweight="bold")
+    ax1.set_xlabel("N  (number of tool calls in the task)", fontsize=12)
+    ax1.set_ylabel("Required decode TPS (tokens/s)", fontsize=12)
+    ax1.set_title("Required decode-TPS vs #tools\nSequential grows ~linearly, Batch stays flat",
                   fontsize=12, fontweight="bold")
-    ax1.set_yscale("log")
-    ax1.grid(True, which="both", alpha=0.3)
+    ax1.grid(True, alpha=0.3)
     ax1.legend(fontsize=9, loc="upper left")
 
-    # 右圖: 聚合需求(兩者相同) vs SoC 聚合能力 -> 看硬體 roofline 可不可行
-    ax2.plot(Ns, seq_plot, "o-", color="#d62728", lw=2.4,
-             label="Required AGGREGATE decode TPS (same for both)")
-    ax2.plot(Ns, cap_agg, "s--", color="#2ca02c", lw=2,
-             label=f"SoC aggregate capability (single {SOC_DECODE_TPS_SINGLE:.0f}, roof {SOC_DECODE_TPS_ROOF:.0f})")
-    ax2.axvline(N_max + 0.5, color="gray", lw=1.5, ls="--")
-    ax2.set_xlabel("N  (paths to finish within the SAME 3.5s)", fontsize=12)
-    ax2.set_ylabel("Aggregate decode TPS (tokens/s)", fontsize=12)
-    ax2.set_title("Aggregate requirement vs SoC roofline\n(feasibility: green must stay above red)",
-                  fontsize=12, fontweight="bold")
-    ax2.set_yscale("log")
-    ax2.grid(True, which="both", alpha=0.3)
-    ax2.legend(fontsize=9, loc="upper left")
+    # ---- 右圖: N=3 的時間軸拆解 (用 SoC 單流速度換算 decode 時間) ----
+    def timeline(decode_tool_tokens):
+        vit = info3["vit_s"] * 1000
+        pf  = info3["prefill_s"] * 1000
+        td  = decode_tool_tokens / SOC_DECODE_TPS_SINGLE * 1000
+        fd  = FINAL_REPLY_TOK / SOC_DECODE_TPS_SINGLE * 1000
+        return vit, pf, td, fd
 
-    txt = (f"Inputs:  {N_IMAGES} imgs (Qwen ViT {c['vision_tokens']} vis-tok) + {N_TEXT_TOKENS} txt "
-           f"= {c['initial_input']} input tok\n"
-           f"Per path:  ViT {c['vit_s']*1000:.0f}ms + Prefill {c['prefill_s']*1000:.0f}ms "
-           f"= F {F*1000:.0f}ms   |   Decode D = {D} tok   |   Deadline T = {T}s (TOTAL for all N)   "
-           f"|   KV-cache {'ON' if USE_KV_CACHE else 'OFF'}")
-    fig.suptitle("Cabin AI — 3-step Agentic task: Sequential vs Batch decode-TPS requirement",
+    seq_tool_wall = N_TOOL_STEPS * DECODE_TOK_PER_STEP   # 90
+    bat_tool_wall = DECODE_TOK_PER_STEP                  # 30
+    segs = [("ViT", "#8c564b"), ("Prefill", "#1f77b4"),
+            ("Tool decode", "#d62728"), ("Final reply decode", "#9467bd")]
+    data = {
+        "Sequential": timeline(seq_tool_wall),
+        "Batch":      timeline(bat_tool_wall),
+    }
+    ypos = {"Sequential": 1, "Batch": 0}
+    for name, vals in data.items():
+        left = 0
+        for (label, color), v in zip(segs, vals):
+            ax2.barh(ypos[name], v, left=left, color=color, edgecolor="white",
+                     label=label if name == "Sequential" else None)
+            if v > 120:
+                ax2.text(left + v/2, ypos[name], f"{v:.0f}", ha="center", va="center",
+                         color="white", fontsize=9, fontweight="bold")
+            left += v
+        ax2.text(left + 30, ypos[name], f"total {left:.0f} ms",
+                 va="center", fontsize=10, fontweight="bold")
+    ax2.axvline(DEADLINE_S * 1000, color="black", lw=2, ls="--")
+    ax2.text(DEADLINE_S*1000 - 30, 1.45, f"deadline {DEADLINE_S*1000:.0f} ms",
+             ha="right", color="black", fontsize=10, fontweight="bold")
+    ax2.set_yticks([0, 1]); ax2.set_yticklabels(["Batch", "Sequential"], fontsize=11)
+    ax2.set_xlabel(f"wall-clock time (ms)  @ SoC decode {SOC_DECODE_TPS_SINGLE:.0f} tok/s", fontsize=12)
+    ax2.set_title(f"Timeline breakdown for this task (N={N_TOOL_STEPS} tools)\n"
+                  "Batch shrinks the tool-decode block 3x -> 30 tok",
+                  fontsize=12, fontweight="bold")
+    ax2.set_ylim(-0.6, 1.7)
+    ax2.legend(fontsize=9, loc="lower right")
+    ax2.grid(True, axis="x", alpha=0.3)
+
+    txt = (f"Inputs: {N_IMAGES} imgs (Qwen ViT {info3['vision_tokens']} vis-tok) + {N_TEXT_TOKENS} txt "
+           f"= {info3['initial_input']} tok  |  ViT {info3['vit_s']*1000:.0f}ms + "
+           f"Prefill {info3['prefill_s']*1000:.0f}ms = F {F3*1000:.0f}ms  |  "
+           f"tool 30 tok/call, final {FINAL_REPLY_TOK} tok  |  T={T}s  |  KV-cache "
+           f"{'ON' if USE_KV_CACHE else 'OFF'}")
+    fig.suptitle("Cabin AI — 3-step Agentic task: Sequential vs Batch tool-decode TPS requirement",
                  fontsize=13, fontweight="bold")
-    fig.text(0.5, 0.03, txt, ha="center", fontsize=9.5, family="monospace")
-    fig.subplots_adjust(left=0.06, right=0.985, top=0.84, bottom=0.16, wspace=0.20)
+    fig.text(0.5, 0.02, txt, ha="center", fontsize=9, family="monospace")
+    fig.subplots_adjust(left=0.06, right=0.985, top=0.84, bottom=0.15, wspace=0.22)
 
     out = "tps_requirement_trend.png"
     fig.savefig(out, dpi=130)
