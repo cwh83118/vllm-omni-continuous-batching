@@ -180,31 +180,41 @@ def single_path_costs(verbose=True):
 
 
 # ============================================================
-# 5) TPS 需求公式
+# 5) TPS 需求公式  (★同一個 3.5s total, N 路全部要做完★)
 # ============================================================
 #
 # 令 F = 單路 (prefill + ViT) 序列化固定成本, D = 單路 decode token 數, T = deadline(3.5s)
 #
-# 【序列 Sequential】 任務一個一個做, 每個任務各自要在 T 內完成:
-#       需求 decode TPS = D / (T - F)            (與 N 無關, 但服務 N 個人總延遲 = N x T)
+# 兩種模式「都」要在同一個 T 內把 N 路全部做完。
+# Prefill / ViT 都不能 batch -> 兩種模式的序列化固定成本都是 N x F。
+# 留給 decode 的時間都是 (T - N x F); 要 decode 的總量都是 N x D。
+# 可行條件 (兩者共用): N x F < T  -> 硬上限 N_max = floor(T / F)
 #
-# 【併發 Concurrent (N 路)】 Prefill/ViT 不能 batch -> 序列化 = N x F
-#   剩餘時間給「可 batch 的 decode」: T - N x F
-#   N 路 decode 總工作量 = N x D tokens, 需在剩餘時間內由 batch 引擎吐完:
-#       需求「聚合」decode TPS  A(N) = (N x D) / (T - N x F)
-#       需求「單路」decode TPS      = A(N)/N = D / (T - N x F)
-#   可行條件: N x F < T  (否則光 prefill+ViT 就吃光 3.5s) -> 硬上限 N_max = floor(T / F)
+# 【序列 Sequential】 一條 stream 把 N x D 個 token 逐一吐完:
+#       需求「單流」decode TPS = (N x D) / (T - N x F)        <-- 必須由"一條"stream 達成
 #
-def seq_required_tps(D, F, T=DEADLINE_S):
-    return D / (T - F)
-
-def conc_required_aggregate_tps(N, D, F, T=DEADLINE_S):
+# 【併發 Batch (N 路)】 N 條 stream 一起 decode (每個 step 同時吐 N 個 token):
+#       decode 牆鐘 = D / 每流TPS  (與 N 無關!)
+#       需求「每流」decode TPS  = D / (T - N x F)             <-- 每條只要這麼快
+#       需求「聚合」decode TPS  = (N x D) / (T - N x F)       <-- 與序列的單流需求同值
+#
+# ★ TPS 差異: 聚合需求相同, 但序列要"一條"stream 扛, batch 拆給 N 條 ->
+#   每流門檻低 N 倍。這就是 batch 的優勢 (= 倍率 N)。
+#
+def seq_required_tps(N, D, F, T=DEADLINE_S):
+    """序列: 單一條 stream 要吐完 N x D 個 token 的需求 TPS。"""
     denom = T - N * F
     return np.where(denom > 0, (N * D) / denom, np.inf)
 
-def conc_required_perstream_tps(N, D, F, T=DEADLINE_S):
+def batch_required_perstream_tps(N, D, F, T=DEADLINE_S):
+    """併發 batch: 每一條 stream 的需求 TPS。"""
     denom = T - N * F
     return np.where(denom > 0, D / denom, np.inf)
+
+def batch_required_aggregate_tps(N, D, F, T=DEADLINE_S):
+    """併發 batch: 聚合需求 TPS (= 序列的單流需求同值)。"""
+    denom = T - N * F
+    return np.where(denom > 0, (N * D) / denom, np.inf)
 
 def soc_aggregate_capability(N):
     """SoC batch 後可達到的聚合 decode 吞吐: 近線性成長到 roofline 飽和。"""
@@ -219,83 +229,89 @@ def main():
     D, F = c["decode_tokens"], c["fixed_s"]
     T = DEADLINE_S
 
-    N_max = int(np.floor(T / F))   # prefill 序列化的硬上限
-    seq_tps = seq_required_tps(D, F, T)
+    N_max = int(np.floor(T / F))   # prefill 序列化的硬上限 (兩模式共用)
 
-    print("=" * 64)
-    print("結果")
-    print("=" * 64)
-    print(f"[序列] 每個任務需求 decode TPS = {seq_tps:.1f} tok/s (與 N 無關)")
-    print(f"       服務 N 人總延遲 = N x {T}s (第 N 人要等 {T*1:.1f}*N 秒)")
-    print(f"[併發] Prefill 不可 batch 的硬上限 N_max = floor({T}/{F:.3f}) = {N_max} 路")
-    print(f"       (N>{N_max} 時, 光 prefill+ViT 就 > {T}s, 不可行)")
+    print("=" * 72)
+    print("結果  (同一個 3.5s total, N 路全部要做完)")
+    print("=" * 72)
+    print(f"硬上限 N_max = floor({T}/{F:.3f}) = {N_max} 路  "
+          f"(N>{N_max} 時光 prefill+ViT 就 > {T}s, 兩種模式都不可行)")
     print()
-    print(f"{'N':>3} | {'剩餘decode時間':>13} | {'聚合需求TPS':>11} | {'單路需求TPS':>11} | {'SoC聚合能力':>10} | 可行?")
-    print("-" * 78)
+    print(f"{'N':>3} | {'decode預算':>9} | {'序列單流需求':>11} | {'batch每流需求':>12} | "
+          f"{'聚合(=序列)':>10} | {'差異倍率':>7}")
+    print("-" * 72)
     for N in range(1, N_max + 3):
         denom = T - N * F
         if denom <= 0:
-            print(f"{N:>3} | {'<=0 (prefill 吃光)':>13} | {'INF':>11} | {'INF':>11} | "
-                  f"{soc_aggregate_capability(N):>10.0f} | NO")
+            print(f"{N:>3} | {'<=0':>9} | {'INF':>11} | {'INF':>12} | {'INF':>10} | {N:>6}x")
             continue
-        agg = (N * D) / denom
-        per = D / denom
-        cap = soc_aggregate_capability(N)
-        ok = "YES" if cap >= agg else "NO"
-        print(f"{N:>3} | {denom*1000:>10.0f} ms | {agg:>11.0f} | {per:>11.0f} | {cap:>10.0f} | {ok}")
+        seq = (N * D) / denom          # 序列: 單流需求
+        per = D / denom                # batch: 每流需求
+        agg = (N * D) / denom          # batch: 聚合需求 (= 序列單流需求)
+        print(f"{N:>3} | {denom*1000:>6.0f} ms | {seq:>9.0f} t/s | {per:>10.0f} t/s | "
+              f"{agg:>8.0f} t/s | {N:>6}x")
+    print()
+    print("解讀: 聚合需求兩者相同; 序列要『一條 stream』扛下整個聚合 (極難),")
+    print("      batch 拆成 N 條 -> 每流門檻低 N 倍, 這就是 batch 的 TPS 優勢。")
     print()
 
     # -------- 畫圖 --------
     Ns = np.arange(1, max(N_max + 2, 10) + 1)
-    agg_req = conc_required_aggregate_tps(Ns, D, F, T)
-    per_req = conc_required_perstream_tps(Ns, D, F, T)
-    cap = soc_aggregate_capability(Ns)
+    seq_req   = seq_required_tps(Ns, D, F, T)                 # 序列: 單流需求 (= 聚合)
+    batch_per = batch_required_perstream_tps(Ns, D, F, T)     # batch: 每流需求
+    cap_agg   = soc_aggregate_capability(Ns)
 
-    # 把 inf 換成 nan 以免畫面爆掉
-    agg_plot = np.where(np.isfinite(agg_req), agg_req, np.nan)
-    per_plot = np.where(np.isfinite(per_req), per_req, np.nan)
+    seq_plot   = np.where(np.isfinite(seq_req), seq_req, np.nan)
+    batch_plot = np.where(np.isfinite(batch_per), batch_per, np.nan)
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
 
-    # 左圖: 聚合 decode TPS 需求 vs SoC 能力
-    ax1.plot(Ns, agg_plot, "o-", color="#d62728", lw=2.2, label="Concurrent: required AGGREGATE decode TPS")
-    ax1.plot(Ns, cap, "s--", color="#2ca02c", lw=2, label=f"SoC aggregate capability (roof={SOC_DECODE_TPS_ROOF:.0f})")
-    ax1.axhline(seq_tps, color="#1f77b4", lw=2, ls=":",
-                label=f"Sequential required TPS = {seq_tps:.0f} (const)")
+    # 左圖: ★TPS 差異★ — 序列(單流) vs batch(每流) 的需求 decode TPS
+    ax1.plot(Ns, seq_plot, "o-", color="#d62728", lw=2.4,
+             label="SEQUENTIAL: required single-stream TPS = N*D/(T-N*F)")
+    ax1.plot(Ns, batch_plot, "o-", color="#9467bd", lw=2.4,
+             label="BATCH: required per-stream TPS = D/(T-N*F)")
+    ax1.axhline(SOC_DECODE_TPS_SINGLE, color="#ff7f0e", lw=2, ls="--",
+                label=f"SoC single-stream decode = {SOC_DECODE_TPS_SINGLE:.0f}")
     ax1.axvline(N_max + 0.5, color="gray", lw=1.5, ls="--")
-    ax1.text(N_max + 0.55, ax1.get_ylim()[1]*0.5 if False else 1,
+    ax1.text(N_max + 0.55, SOC_DECODE_TPS_SINGLE,
              f"  Prefill hard limit\n  N_max = {N_max}", color="gray", va="bottom", fontsize=10)
-    ax1.set_xlabel("N  (concurrent paths)", fontsize=12)
-    ax1.set_ylabel("Decode TPS (tokens/s)", fontsize=12)
-    ax1.set_title("Aggregate decode-TPS requirement vs SoC capability", fontsize=12, fontweight="bold")
+    # 標出幾個點的 N 倍差距
+    for n in [2, 4, 6, 8]:
+        if T - n * F > 0:
+            ax1.annotate(f"{n}x", xy=(n, (n*D)/(T-n*F)), xytext=(n-0.15, (n*D)/(T-n*F)*1.15),
+                         color="#d62728", fontsize=9, fontweight="bold")
+    ax1.set_xlabel("N  (paths to finish within the SAME 3.5s)", fontsize=12)
+    ax1.set_ylabel("Required decode TPS per stream (tokens/s)", fontsize=12)
+    ax1.set_title("TPS DIFFERENCE: Sequential vs Batch\n(per-stream requirement; gap = N x)",
+                  fontsize=12, fontweight="bold")
     ax1.set_yscale("log")
     ax1.grid(True, which="both", alpha=0.3)
     ax1.legend(fontsize=9, loc="upper left")
 
-    # 右圖: 單路 decode TPS 需求 + 時間預算拆解
-    ax2.plot(Ns, per_plot, "o-", color="#9467bd", lw=2.2,
-             label="Concurrent: required PER-STREAM decode TPS")
-    ax2.axhline(seq_tps, color="#1f77b4", lw=2, ls=":",
-                label=f"Sequential required = {seq_tps:.0f}")
-    ax2.axhline(SOC_DECODE_TPS_SINGLE, color="#ff7f0e", lw=2, ls="--",
-                label=f"SoC single-stream decode = {SOC_DECODE_TPS_SINGLE:.0f}")
+    # 右圖: 聚合需求(兩者相同) vs SoC 聚合能力 -> 看硬體 roofline 可不可行
+    ax2.plot(Ns, seq_plot, "o-", color="#d62728", lw=2.4,
+             label="Required AGGREGATE decode TPS (same for both)")
+    ax2.plot(Ns, cap_agg, "s--", color="#2ca02c", lw=2,
+             label=f"SoC aggregate capability (single {SOC_DECODE_TPS_SINGLE:.0f}, roof {SOC_DECODE_TPS_ROOF:.0f})")
     ax2.axvline(N_max + 0.5, color="gray", lw=1.5, ls="--")
-    ax2.set_xlabel("N  (concurrent paths)", fontsize=12)
-    ax2.set_ylabel("Per-stream decode TPS (tokens/s)", fontsize=12)
-    ax2.set_title("Per-stream decode-TPS requirement\n(rises because serialized prefill eats the 3.5s budget)",
+    ax2.set_xlabel("N  (paths to finish within the SAME 3.5s)", fontsize=12)
+    ax2.set_ylabel("Aggregate decode TPS (tokens/s)", fontsize=12)
+    ax2.set_title("Aggregate requirement vs SoC roofline\n(feasibility: green must stay above red)",
                   fontsize=12, fontweight="bold")
-    ax2.grid(True, alpha=0.3)
+    ax2.set_yscale("log")
+    ax2.grid(True, which="both", alpha=0.3)
     ax2.legend(fontsize=9, loc="upper left")
 
     txt = (f"Inputs:  {N_IMAGES} imgs (Qwen ViT {c['vision_tokens']} vis-tok) + {N_TEXT_TOKENS} txt "
            f"= {c['initial_input']} input tok\n"
            f"Per path:  ViT {c['vit_s']*1000:.0f}ms + Prefill {c['prefill_s']*1000:.0f}ms "
-           f"= F {F*1000:.0f}ms   |   Decode D = {D} tok   |   Deadline T = {T}s   "
+           f"= F {F*1000:.0f}ms   |   Decode D = {D} tok   |   Deadline T = {T}s (TOTAL for all N)   "
            f"|   KV-cache {'ON' if USE_KV_CACHE else 'OFF'}")
-    fig.suptitle("Cabin AI — 3-step Agentic task: TPS requirement trend (Sequential vs Concurrent)",
+    fig.suptitle("Cabin AI — 3-step Agentic task: Sequential vs Batch decode-TPS requirement",
                  fontsize=13, fontweight="bold")
     fig.text(0.5, 0.03, txt, ha="center", fontsize=9.5, family="monospace")
-    fig.subplots_adjust(left=0.06, right=0.985, top=0.86, bottom=0.16, wspace=0.20)
+    fig.subplots_adjust(left=0.06, right=0.985, top=0.84, bottom=0.16, wspace=0.20)
 
     out = "tps_requirement_trend.png"
     fig.savefig(out, dpi=130)
